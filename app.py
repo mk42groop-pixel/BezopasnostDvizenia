@@ -1,14 +1,13 @@
 import os
 import logging
-import asyncio
 import sqlite3
-import json
+import asyncio
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 import requests
+import httpx
 
 # Настройка логирования
 logging.basicConfig(
@@ -88,28 +87,6 @@ DASHBOARD_HTML = '''
         button:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0,0,0,0.2); }
         button.success { background: linear-gradient(135deg, #27ae60, #229954); }
         
-        .jobs-list { background: white; border-radius: 10px; overflow: hidden; }
-        .job-item { 
-            padding: 15px 20px; border-bottom: 1px solid #ecf0f1;
-            display: flex; justify-content: space-between; align-items: center;
-        }
-        .job-item:last-child { border-bottom: none; }
-        .job-info { flex: 1; }
-        .job-name { font-weight: 600; color: #2c3e50; }
-        .job-time { color: #7f8c8d; font-size: 0.9em; }
-        .job-status { 
-            padding: 5px 12px; border-radius: 20px; font-size: 0.8em;
-            font-weight: 600;
-        }
-        .status-active { background: #d5f4e6; color: #27ae60; }
-        
-        .logs { background: #2c3e50; color: white; padding: 20px; border-radius: 10px; }
-        .log-entry { 
-            padding: 8px 0; border-bottom: 1px solid #34495e; 
-            font-family: 'Courier New', monospace; font-size: 0.9em;
-        }
-        .log-entry:last-child { border-bottom: none; }
-        
         .alert { 
             padding: 15px; border-radius: 8px; margin: 15px 0;
             border-left: 5px solid;
@@ -141,12 +118,6 @@ DASHBOARD_HTML = '''
                 <div class="stat-label">Статус бота</div>
                 <div class="stat-number">{% if bot_status == 'active' %}✅ Активен{% else %}❌ Ошибка{% endif %}</div>
                 <div class="stat-label">{{ channel_status }}</div>
-            </div>
-            
-            <div class="stat-card">
-                <div class="stat-label">Запланировано заданий</div>
-                <div class="stat-number">{{ jobs_count }}</div>
-                <div class="stat-label">на сегодня</div>
             </div>
             
             <div class="stat-card">
@@ -194,33 +165,9 @@ DASHBOARD_HTML = '''
                     
                     <div class="btn-group">
                         <a href="/test-connection" class="btn btn-primary">🔗 Тест подключения</a>
-                        <a href="/force-schedule" class="btn btn-success">⏰ Запустить все задания</a>
+                        <a href="/send-test" class="btn btn-success">🧪 Тестовое сообщение</a>
                         <a href="/clear-logs" class="btn btn-danger">🗑️ Очистить логи</a>
                     </div>
-                </div>
-            </div>
-            
-            <div class="section">
-                <h2 class="section-title">⏰ Запланированные задания</h2>
-                <div class="jobs-list">
-                    {% for job in scheduled_jobs %}
-                    <div class="job-item">
-                        <div class="job-info">
-                            <div class="job-name">{{ job.name }}</div>
-                            <div class="job-time">Следующий запуск: {{ job.next_run }}</div>
-                        </div>
-                        <div class="job-status status-active">Активно</div>
-                    </div>
-                    {% endfor %}
-                </div>
-            </div>
-            
-            <div class="section">
-                <h2 class="section-title">📋 Последние логи</h2>
-                <div class="logs">
-                    {% for log in recent_logs %}
-                    <div class="log-entry">{{ log.timestamp }} - {{ log.message }}</div>
-                    {% endfor %}
                 </div>
             </div>
         </div>
@@ -231,8 +178,6 @@ DASHBOARD_HTML = '''
             const customGroup = document.getElementById('custom_text_group');
             customGroup.style.display = this.value === 'custom' ? 'block' : 'none';
         });
-        
-        setTimeout(() => { location.reload(); }, 30000);
     </script>
 </body>
 </html>
@@ -252,18 +197,7 @@ class SafetyContentManager:
             self.channel_status = "❌ Переменные окружения не установлены"
             return
         
-        try:
-            # Инициализация Telegram бота
-            from telegram import Bot
-            self.bot = Bot(token=self.bot_token)
-            self.bot_status = "active"
-            logger.info("Telegram bot initialized successfully")
-        except Exception as e:
-            logger.error(f"Error initializing bot: {e}")
-            self.bot_status = "error"
-            self.channel_status = f"❌ Ошибка инициализации: {e}"
-            return
-        
+        self.bot_status = "active"
         self.init_db()
         self.content_db = self._load_all_content()
         self.setup_scheduler()
@@ -272,11 +206,27 @@ class SafetyContentManager:
     async def test_channel_connection(self):
         """Тестирование подключения к каналу"""
         try:
-            chat = await self.bot.get_chat(self.channel_id)
-            self.channel_status = f"✅ Канал: {chat.title}"
-            logger.info(f"Channel access confirmed: {chat.title}")
+            # Используем прямое HTTP-подключение вместо библиотеки
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"https://api.telegram.org/bot{self.bot_token}/getChat",
+                    params={"chat_id": self.channel_id},
+                    timeout=30.0
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('ok'):
+                        chat_title = data['result'].get('title', 'Unknown')
+                        self.channel_status = f"✅ Канал: {chat_title}"
+                        logger.info(f"Channel access confirmed: {chat_title}")
+                    else:
+                        self.channel_status = f"❌ Ошибка: {data.get('description', 'Unknown error')}"
+                else:
+                    self.channel_status = f"❌ HTTP Error: {response.status_code}"
+                    
         except Exception as e:
-            self.channel_status = f"❌ Ошибка доступа: {e}"
+            self.channel_status = f"❌ Ошибка подключения: {e}"
             logger.error(f"Channel access failed: {e}")
 
     def init_db(self):
@@ -290,7 +240,6 @@ class SafetyContentManager:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     post_type TEXT,
                     content TEXT,
-                    scheduled_time DATETIME,
                     actual_time DATETIME DEFAULT CURRENT_TIMESTAMP,
                     status TEXT,
                     message TEXT
@@ -321,7 +270,6 @@ class SafetyContentManager:
             'daily_rules': {
                 1: "🚦 <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ п.12.1: Машинист обязан немедленно принимать меры к остановке при получении сигнала остановки или возникновении опасности для движения.",
                 2: "👀 <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ п.12.7: Машинист должен вести поезд, внимательно наблюдая за путем, показаниями приборов и сигналов.",
-                3: "🛑 <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ Прил.2: Перед отправлением поезда машинист обязан убедиться в правильности подготовки тормозов и опробованием проверить их действие.",
             },
             'safety_numbers': {
                 1: "📊 <b>ЦИФРА БЕЗОПАСНОСТИ</b>\n\nОстановочный путь грузового поезда 6000т на спуске 10‰ при 70км/ч составляет ~1200 метров",
@@ -370,15 +318,33 @@ class SafetyContentManager:
             if health_url:
                 requests.get(health_url, timeout=10)
             logger.info("Keep-alive ping sent")
-            
-            # Также пингуем наш собственный эндпоинт
-            try:
-                requests.get(f"https://{os.getenv('RENDER_SERVICE_NAME', 'bezopasnostdvizenia')}.onrender.com/health", timeout=10)
-            except:
-                pass
-                
         except Exception as e:
             logger.warning(f"Keep-alive error: {e}")
+
+    async def send_telegram_message(self, text: str):
+        """Отправка сообщения в Telegram с использованием httpx"""
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
+                    json={
+                        "chat_id": self.channel_id,
+                        "text": text,
+                        "parse_mode": "HTML"
+                    }
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('ok'):
+                        return True, "✅ Сообщение отправлено"
+                    else:
+                        return False, f"❌ Telegram API error: {data.get('description')}"
+                else:
+                    return False, f"❌ HTTP error: {response.status_code}"
+                    
+        except Exception as e:
+            return False, f"❌ Connection error: {str(e)}"
 
     async def send_manual_post(self, post_type: str, custom_text: str = None):
         """Ручная отправка поста"""
@@ -391,18 +357,14 @@ class SafetyContentManager:
             if not content:
                 return "❌ Контент не найден"
             
-            # Используем простую отправку без кнопок для теста
-            await self.bot.send_message(
-                chat_id=self.channel_id,
-                text=content,
-                parse_mode='HTML'
-            )
+            success, result = await self.send_telegram_message(content)
             
-            # Логирование
-            self._log_posting(post_type, content, "manual")
-            self._update_stats()
-            
-            return f"✅ Сообщение отправлено в канал"
+            if success:
+                self._log_posting(post_type, content, "manual")
+                self._update_stats()
+                return result
+            else:
+                return result
             
         except Exception as e:
             error_msg = f"❌ Ошибка отправки: {str(e)}"
@@ -428,9 +390,9 @@ class SafetyContentManager:
             cursor = conn.cursor()
             
             cursor.execute('''
-                INSERT INTO posting_logs (post_type, content, scheduled_time, status, message)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (post_type, str(content)[:200], datetime.now(), 'success', f"Manual: {trigger}"))
+                INSERT INTO posting_logs (post_type, content, status, message)
+                VALUES (?, ?, ?, ?)
+            ''', (post_type, str(content)[:200], 'success', f"Manual: {trigger}"))
             
             conn.commit()
             conn.close()
@@ -458,21 +420,14 @@ class SafetyContentManager:
             cursor.execute('SELECT posts_sent FROM bot_stats')
             posts_sent = cursor.fetchone()[0]
             
-            cursor.execute('SELECT * FROM posting_logs ORDER BY id DESC LIMIT 10')
-            recent_logs = [{
-                'timestamp': row[4].split('.')[0] if row[4] else 'N/A',
-                'message': f"{row[1]}: {row[6]}"
-            } for row in cursor.fetchall()]
-            
             conn.close()
             
             return {
                 'posts_sent': posts_sent,
-                'recent_logs': recent_logs
             }
         except Exception as e:
             logger.error(f"Error getting stats: {e}")
-            return {'posts_sent': 0, 'recent_logs': []}
+            return {'posts_sent': 0}
 
 # Глобальный экземпляр
 safety_manager = SafetyContentManager()
@@ -484,24 +439,12 @@ def dashboard():
     """Главный дашборд"""
     stats = safety_manager.get_stats()
     
-    # Получение запланированных заданий
-    scheduled_jobs = []
-    if hasattr(safety_manager, 'scheduler'):
-        for job in safety_manager.scheduler.get_jobs():
-            scheduled_jobs.append({
-                'name': job.name,
-                'next_run': job.next_run_time.strftime('%Y-%m-%d %H:%M:%S') if job.next_run_time else 'N/A'
-            })
-    
     return render_template_string(DASHBOARD_HTML,
         bot_status=getattr(safety_manager, 'bot_status', 'error'),
         channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
-        jobs_count=len(scheduled_jobs),
         posts_sent=stats['posts_sent'],
         current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
         current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
-        scheduled_jobs=scheduled_jobs,
-        recent_logs=stats['recent_logs'],
         message=request.args.get('message', ''),
         message_type=request.args.get('type', 'success')
     )
@@ -520,46 +463,54 @@ def send_manual():
         )
     
     try:
-        # Запускаем асинхронную функцию
         result = asyncio.run(safety_manager.send_manual_post(post_type, custom_text))
         
-        if "✅" in result:
-            return render_template_string(DASHBOARD_HTML,
-                bot_status=getattr(safety_manager, 'bot_status', 'error'),
-                channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
-                jobs_count=0,
-                posts_sent=safety_manager.get_stats()['posts_sent'],
-                current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
-                current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
-                scheduled_jobs=[],
-                recent_logs=safety_manager.get_stats()['recent_logs'],
-                message=result,
-                message_type="success"
-            )
-        else:
-            return render_template_string(DASHBOARD_HTML,
-                bot_status=getattr(safety_manager, 'bot_status', 'error'),
-                channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
-                jobs_count=0,
-                posts_sent=safety_manager.get_stats()['posts_sent'],
-                current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
-                current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
-                scheduled_jobs=[],
-                recent_logs=safety_manager.get_stats()['recent_logs'],
-                message=result,
-                message_type="danger"
-            )
+        return render_template_string(DASHBOARD_HTML,
+            bot_status=getattr(safety_manager, 'bot_status', 'error'),
+            channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
+            posts_sent=safety_manager.get_stats()['posts_sent'],
+            current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
+            current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
+            message=result,
+            message_type="success" if "✅" in result else "danger"
+        )
             
     except Exception as e:
         return render_template_string(DASHBOARD_HTML,
             bot_status=getattr(safety_manager, 'bot_status', 'error'),
             channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
-            jobs_count=0,
             posts_sent=safety_manager.get_stats()['posts_sent'],
             current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
             current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
-            scheduled_jobs=[],
-            recent_logs=safety_manager.get_stats()['recent_logs'],
+            message=f"❌ Ошибка: {str(e)}",
+            message_type="danger"
+        )
+
+@app.route('/send-test')
+def send_test():
+    """Отправка тестового сообщения"""
+    try:
+        test_message = "🧪 <b>ТЕСТОВОЕ СООБЩЕНИЕ</b>\n\nБот безопасности РЖД успешно работает! ✅\n\nКанал: <b>БД БПЖТ</b>\nВремя: " + datetime.now().strftime("%H:%M")
+        result = asyncio.run(safety_manager.send_telegram_message(test_message))
+        
+        success, message = result
+        return render_template_string(DASHBOARD_HTML,
+            bot_status=getattr(safety_manager, 'bot_status', 'error'),
+            channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
+            posts_sent=safety_manager.get_stats()['posts_sent'],
+            current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
+            current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
+            message=message,
+            message_type="success" if success else "danger"
+        )
+            
+    except Exception as e:
+        return render_template_string(DASHBOARD_HTML,
+            bot_status=getattr(safety_manager, 'bot_status', 'error'),
+            channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
+            posts_sent=safety_manager.get_stats()['posts_sent'],
+            current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
+            current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
             message=f"❌ Ошибка: {str(e)}",
             message_type="danger"
         )
@@ -572,12 +523,9 @@ def test_connection():
         return render_template_string(DASHBOARD_HTML,
             bot_status=getattr(safety_manager, 'bot_status', 'error'),
             channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
-            jobs_count=0,
             posts_sent=safety_manager.get_stats()['posts_sent'],
             current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
             current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
-            scheduled_jobs=[],
-            recent_logs=safety_manager.get_stats()['recent_logs'],
             message="✅ Тест подключения выполнен",
             message_type="success"
         )
@@ -585,46 +533,10 @@ def test_connection():
         return render_template_string(DASHBOARD_HTML,
             bot_status=getattr(safety_manager, 'bot_status', 'error'),
             channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
-            jobs_count=0,
             posts_sent=safety_manager.get_stats()['posts_sent'],
             current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
             current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
-            scheduled_jobs=[],
-            recent_logs=safety_manager.get_stats()['recent_logs'],
             message=f"❌ Ошибка теста: {str(e)}",
-            message_type="danger"
-        )
-
-@app.route('/force-schedule')
-def force_schedule():
-    """Принудительный запуск всех заданий"""
-    try:
-        # Отправляем тестовое сообщение
-        asyncio.run(safety_manager.send_manual_post('daily_rule'))
-        
-        return render_template_string(DASHBOARD_HTML,
-            bot_status=getattr(safety_manager, 'bot_status', 'error'),
-            channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
-            jobs_count=0,
-            posts_sent=safety_manager.get_stats()['posts_sent'],
-            current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
-            current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
-            scheduled_jobs=[],
-            recent_logs=safety_manager.get_stats()['recent_logs'],
-            message="✅ Тестовое сообщение отправлено",
-            message_type="success"
-        )
-    except Exception as e:
-        return render_template_string(DASHBOARD_HTML,
-            bot_status=getattr(safety_manager, 'bot_status', 'error'),
-            channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
-            jobs_count=0,
-            posts_sent=safety_manager.get_stats()['posts_sent'],
-            current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
-            current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
-            scheduled_jobs=[],
-            recent_logs=safety_manager.get_stats()['recent_logs'],
-            message=f"❌ Ошибка: {str(e)}",
             message_type="danger"
         )
 
@@ -642,12 +554,9 @@ def clear_logs():
         return render_template_string(DASHBOARD_HTML,
             bot_status=getattr(safety_manager, 'bot_status', 'error'),
             channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
-            jobs_count=0,
             posts_sent=0,
             current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
             current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
-            scheduled_jobs=[],
-            recent_logs=[],
             message="✅ Логи очищены",
             message_type="success"
         )
@@ -655,12 +564,9 @@ def clear_logs():
         return render_template_string(DASHBOARD_HTML,
             bot_status=getattr(safety_manager, 'bot_status', 'error'),
             channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
-            jobs_count=0,
             posts_sent=safety_manager.get_stats()['posts_sent'],
             current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
             current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
-            scheduled_jobs=[],
-            recent_logs=safety_manager.get_stats()['recent_logs'],
             message=f"❌ Ошибка очистки: {str(e)}",
             message_type="danger"
         )
