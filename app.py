@@ -1,18 +1,14 @@
 import os
 import logging
 import asyncio
-import threading
-import time
-from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
 import sqlite3
-from typing import Dict, List, Tuple, Optional
+import json
+from datetime import datetime
+from flask import Flask, request, jsonify, render_template_string
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import requests
-from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # Настройка логирования
 logging.basicConfig(
@@ -22,27 +18,267 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key')
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'rzd-safety-secret-2024')
+
+# HTML шаблон для дашборда
+DASHBOARD_HTML = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RZD Safety Bot Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh; padding: 20px;
+        }
+        .container { 
+            max-width: 1200px; margin: 0 auto; 
+            background: white; border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1); overflow: hidden;
+        }
+        .header { 
+            background: linear-gradient(135deg, #2c3e50, #34495e);
+            color: white; padding: 30px; text-align: center;
+        }
+        .header h1 { font-size: 2.5em; margin-bottom: 10px; }
+        .header p { opacity: 0.9; font-size: 1.1em; }
+        
+        .stats-grid { 
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px; padding: 30px; background: #f8f9fa;
+        }
+        .stat-card { 
+            background: white; padding: 25px; border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1); text-align: center;
+            border-left: 5px solid #3498db;
+        }
+        .stat-card.success { border-left-color: #27ae60; }
+        .stat-card.warning { border-left-color: #f39c12; }
+        .stat-card.danger { border-left-color: #e74c3c; }
+        .stat-number { 
+            font-size: 2.5em; font-weight: bold; color: #2c3e50;
+            margin: 10px 0;
+        }
+        .stat-label { color: #7f8c8d; font-size: 0.9em; }
+        
+        .content { padding: 30px; }
+        .section { margin-bottom: 40px; }
+        .section-title { 
+            font-size: 1.5em; color: #2c3e50; margin-bottom: 20px;
+            padding-bottom: 10px; border-bottom: 2px solid #ecf0f1;
+        }
+        
+        .manual-post { background: #f8f9fa; padding: 25px; border-radius: 10px; }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; margin-bottom: 8px; font-weight: 600; color: #2c3e50; }
+        select, textarea, button { 
+            width: 100%; padding: 12px; border: 2px solid #ddd;
+            border-radius: 8px; font-size: 1em;
+        }
+        textarea { height: 120px; resize: vertical; }
+        button { 
+            background: linear-gradient(135deg, #3498db, #2980b9);
+            color: white; border: none; cursor: pointer;
+            font-weight: 600; transition: all 0.3s;
+        }
+        button:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0,0,0,0.2); }
+        button.success { background: linear-gradient(135deg, #27ae60, #229954); }
+        
+        .jobs-list { background: white; border-radius: 10px; overflow: hidden; }
+        .job-item { 
+            padding: 15px 20px; border-bottom: 1px solid #ecf0f1;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .job-item:last-child { border-bottom: none; }
+        .job-info { flex: 1; }
+        .job-name { font-weight: 600; color: #2c3e50; }
+        .job-time { color: #7f8c8d; font-size: 0.9em; }
+        .job-status { 
+            padding: 5px 12px; border-radius: 20px; font-size: 0.8em;
+            font-weight: 600;
+        }
+        .status-active { background: #d5f4e6; color: #27ae60; }
+        
+        .logs { background: #2c3e50; color: white; padding: 20px; border-radius: 10px; }
+        .log-entry { 
+            padding: 8px 0; border-bottom: 1px solid #34495e; 
+            font-family: 'Courier New', monospace; font-size: 0.9em;
+        }
+        .log-entry:last-child { border-bottom: none; }
+        
+        .alert { 
+            padding: 15px; border-radius: 8px; margin: 15px 0;
+            border-left: 5px solid;
+        }
+        .alert-success { background: #d5f4e6; border-color: #27ae60; color: #155724; }
+        .alert-danger { background: #f8d7da; border-color: #e74c3c; color: #721c24; }
+        .alert-warning { background: #fff3cd; border-color: #f39c12; color: #856404; }
+        
+        .btn-group { display: flex; gap: 10px; margin-top: 15px; }
+        .btn { 
+            padding: 10px 20px; border: none; border-radius: 6px;
+            cursor: pointer; font-weight: 600; text-decoration: none;
+            display: inline-block; text-align: center;
+        }
+        .btn-primary { background: #3498db; color: white; }
+        .btn-success { background: #27ae60; color: white; }
+        .btn-danger { background: #e74c3c; color: white; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚂 RZD Safety Bot Dashboard</h1>
+            <p>Панель управления ботом безопасности движения РЖД</p>
+        </div>
+        
+        <div class="stats-grid">
+            <div class="stat-card {% if bot_status == 'active' %}success{% else %}danger{% endif %}">
+                <div class="stat-label">Статус бота</div>
+                <div class="stat-number">{% if bot_status == 'active' %}✅ Активен{% else %}❌ Ошибка{% endif %}</div>
+                <div class="stat-label">{{ channel_status }}</div>
+            </div>
+            
+            <div class="stat-card">
+                <div class="stat-label">Запланировано заданий</div>
+                <div class="stat-number">{{ jobs_count }}</div>
+                <div class="stat-label">на сегодня</div>
+            </div>
+            
+            <div class="stat-card">
+                <div class="stat-label">Отправлено сообщений</div>
+                <div class="stat-number">{{ posts_sent }}</div>
+                <div class="stat-label">всего</div>
+            </div>
+            
+            <div class="stat-card">
+                <div class="stat-label">Время сервера</div>
+                <div class="stat-number" style="font-size: 1.8em;">{{ current_time_utc }}</div>
+                <div class="stat-label">Кемерово: {{ current_time_kemerovo }}</div>
+            </div>
+        </div>
+        
+        <div class="content">
+            {% if message %}
+            <div class="alert alert-{{ message_type }}">{{ message }}</div>
+            {% endif %}
+            
+            <div class="section">
+                <h2 class="section-title">📊 Ручная отправка постов</h2>
+                <div class="manual-post">
+                    <form method="POST" action="/send-manual">
+                        <div class="form-group">
+                            <label for="post_type">Тип контента:</label>
+                            <select id="post_type" name="post_type" required>
+                                <option value="daily_rule">🚦 Правило дня</option>
+                                <option value="safety_number">📊 Цифра безопасности</option>
+                                <option value="tech_training">🔧 Техническая подготовка</option>
+                                <option value="incident_analysis">🔍 Анализ инцидента</option>
+                                <option value="psychology">🧠 Психология безопасности</option>
+                                <option value="assistant_duties">👨‍💼 Обязанности помощника</option>
+                                <option value="custom">✏️ Произвольный текст</option>
+                            </select>
+                        </div>
+                        
+                        <div class="form-group" id="custom_text_group" style="display: none;">
+                            <label for="custom_text">Произвольный текст:</label>
+                            <textarea id="custom_text" name="custom_text" placeholder="Введите текст сообщения..."></textarea>
+                        </div>
+                        
+                        <button type="submit" class="success">📨 Отправить в канал</button>
+                    </form>
+                    
+                    <div class="btn-group">
+                        <a href="/test-connection" class="btn btn-primary">🔗 Тест подключения</a>
+                        <a href="/force-schedule" class="btn btn-success">⏰ Запустить все задания</a>
+                        <a href="/clear-logs" class="btn btn-danger">🗑️ Очистить логи</a>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="section">
+                <h2 class="section-title">⏰ Запланированные задания</h2>
+                <div class="jobs-list">
+                    {% for job in scheduled_jobs %}
+                    <div class="job-item">
+                        <div class="job-info">
+                            <div class="job-name">{{ job.name }}</div>
+                            <div class="job-time">Следующий запуск: {{ job.next_run }}</div>
+                        </div>
+                        <div class="job-status status-active">Активно</div>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            
+            <div class="section">
+                <h2 class="section-title">📋 Последние логи</h2>
+                <div class="logs">
+                    {% for log in recent_logs %}
+                    <div class="log-entry">{{ log.timestamp }} - {{ log.message }}</div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('post_type').addEventListener('change', function() {
+            const customGroup = document.getElementById('custom_text_group');
+            customGroup.style.display = this.value === 'custom' ? 'block' : 'none';
+        });
+        
+        setTimeout(() => { location.reload(); }, 30000);
+    </script>
+</body>
+</html>
+'''
 
 class SafetyContentManager:
     def __init__(self):
         self.bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.channel_id = os.getenv('TELEGRAM_CHANNEL_ID')
         
-        # Настройка таймзон
         self.server_tz = pytz.timezone(os.getenv('SERVER_TIMEZONE', 'UTC'))
         self.target_tz = pytz.timezone(os.getenv('TARGET_TIMEZONE', 'Asia/Novokuznetsk'))
         
         if not self.bot_token or not self.channel_id:
             logger.error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL_ID must be set")
+            self.bot_status = "error"
+            self.channel_status = "❌ Переменные окружения не установлены"
             return
         
-        self.application = Application.builder().token(self.bot_token).build()
+        try:
+            # Инициализация Telegram бота
+            from telegram import Bot
+            self.bot = Bot(token=self.bot_token)
+            self.bot_status = "active"
+            logger.info("Telegram bot initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing bot: {e}")
+            self.bot_status = "error"
+            self.channel_status = f"❌ Ошибка инициализации: {e}"
+            return
+        
         self.init_db()
         self.content_db = self._load_all_content()
-        self.setup_handlers()
         self.setup_scheduler()
+        asyncio.run(self.test_channel_connection())
         
+    async def test_channel_connection(self):
+        """Тестирование подключения к каналу"""
+        try:
+            chat = await self.bot.get_chat(self.channel_id)
+            self.channel_status = f"✅ Канал: {chat.title}"
+            logger.info(f"Channel access confirmed: {chat.title}")
+        except Exception as e:
+            self.channel_status = f"❌ Ошибка доступа: {e}"
+            logger.error(f"Channel access failed: {e}")
+
     def init_db(self):
         """Инициализация базы данных"""
         try:
@@ -50,24 +286,28 @@ class SafetyContentManager:
             cursor = conn.cursor()
             
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS user_responses (
-                    user_id INTEGER,
-                    question_id TEXT,
-                    answer TEXT,
-                    is_correct BOOLEAN,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                CREATE TABLE IF NOT EXISTS posting_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    post_type TEXT,
+                    content TEXT,
+                    scheduled_time DATETIME,
+                    actual_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT,
+                    message TEXT
                 )
             ''')
             
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS posting_logs (
-                    post_type TEXT,
-                    content TEXT,
-                    scheduled_time DATETIME,
-                    actual_time DATETIME,
-                    status TEXT
+                CREATE TABLE IF NOT EXISTS bot_stats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    posts_sent INTEGER DEFAULT 0,
+                    last_activity DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            
+            cursor.execute('SELECT COUNT(*) FROM bot_stats')
+            if cursor.fetchone()[0] == 0:
+                cursor.execute('INSERT INTO bot_stats (posts_sent) VALUES (0)')
             
             conn.commit()
             conn.close()
@@ -75,692 +315,370 @@ class SafetyContentManager:
         except Exception as e:
             logger.error(f"Error initializing database: {e}")
 
-    def convert_to_server_time(self, kemerovo_time_str: str) -> datetime:
-        """Конвертирует время Кемерово (UTC+7) во время сервера (UTC)"""
-        try:
-            kemerovo_time = datetime.strptime(kemerovo_time_str, '%H:%M').time()
-            now = datetime.now(self.target_tz)
-            kemerovo_dt = self.target_tz.localize(
-                datetime.combine(now.date(), kemerovo_time)
-            )
-            server_dt = kemerovo_dt.astimezone(self.server_tz)
-            
-            logger.info(f"Время Кемерово {kemerovo_time_str} -> Серверное время {server_dt.strftime('%H:%M')}")
-            return server_dt
-            
-        except Exception as e:
-            logger.error(f"Ошибка конвертации времени: {e}")
-            return datetime.strptime(kemerovo_time_str, '%H:%M').replace(
-                year=datetime.now().year,
-                month=datetime.now().month,
-                day=datetime.now().day
-            )
+    def _load_all_content(self):
+        """Загрузка всего контента"""
+        return {
+            'daily_rules': {
+                1: "🚦 <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ п.12.1: Машинист обязан немедленно принимать меры к остановке при получении сигнала остановки или возникновении опасности для движения.",
+                2: "👀 <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ п.12.7: Машинист должен вести поезд, внимательно наблюдая за путем, показаниями приборов и сигналов.",
+                3: "🛑 <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ Прил.2: Перед отправлением поезда машинист обязан убедиться в правильности подготовки тормозов и опробованием проверить их действие.",
+            },
+            'safety_numbers': {
+                1: "📊 <b>ЦИФРА БЕЗОПАСНОСТИ</b>\n\nОстановочный путь грузового поезда 6000т на спуске 10‰ при 70км/ч составляет ~1200 метров",
+                2: "⏱️ <b>ЦИФРА БЕЗОПАСНОСТИ</b>\n\nРеакция машиниста 1 секунда = 14 метров пути при скорости 50км/ч",
+            },
+            'tech_training': {
+                1: "🔧 <b>ТЕХНИЧЕСКАЯ ПОДГОТОВКА: ТЭМ2</b>\n\nСистема управления РКСУ: Контроллер имеет 25 позиций. При переходе с позиции на позицию выдерживать паузу 2-3 секунды.",
+                2: "🔧 <b>ТЕХНИЧЕСКАЯ ПОДГОТОВКА: 2ТЭ10М</b>\n\nДизель 10Д100: Критические параметры:\n- Давление масла: мин. 1,2 кгс/см²\n- Температура воды: макс. 90°C",
+            },
+            'incident_analysis': {
+                1: "🔍 <b>АНАЛИЗ ИНЦИДЕНТА</b>\n\nПроезд запрещающего сигнала маневровым тепловозом.\n<b>Цепочка ошибок:</b>\n1. Помощник машиниста отвлекся\n2. Машинист не проконтролировал",
+                2: "🔍 <b>АНАЛИЗ ИНЦИДЕНТА</b>\n\nСамопроизвольный уход подвижного состава.\n<b>Цепочка ошибок:</b>\n1. Недостаточное закрепление\n2. Отсутствие контроля",
+            },
+            'psychology': {
+                1: "🧠 <b>ПСИХОЛОГИЯ БЕЗОПАСНОСТИ</b>\n\nЭффект многозадачности: Мозг переключается между задачами. При подходе к светофорам сведите отвлечения к минимуму.",
+                2: "🧠 <b>ПСИХОЛОГИЯ БЕЗОПАСНОСТИ</b>\n\nСиндром привыкания: После 1000 безопасных поездок риск воспринимается минимальным.",
+            },
+            'assistant_duties': {
+                1: "👨‍💼 <b>ОБЯЗАННОСТИ ПОМОЩНИКА МАШИНИСТА</b>\n\nПри маневрах:\n• Контролировать свободность пути\n• Подавать четкие сигналы машинисту\n• Следить за габаритами",
+                2: "👨‍💼 <b>ОБЯЗАННОСТИ ПОМОЩНИКА МАШИНИСТА</b>\n\nЗакрепление состава:\n• Правильная установка башмаков\n• Контроль ручных тормозов\n• Проверка надежности",
+            }
+        }
 
     def setup_scheduler(self):
-        """Настройка планировщика с учетом таймзоны Кемерово"""
-        self.scheduler = BackgroundScheduler(timezone=str(self.server_tz))
-        
-        # Расписание публикаций (время Кемерово UTC+7)
-        schedule_times = {
-            '08:30': self.send_daily_rule,
-            '10:00': self.send_morning_content,
-            '12:00': self.send_midday_content, 
-            '14:00': self.send_tech_training,
-            '16:00': self.send_incident_analysis,
-            '18:00': self.send_psychology,
-            '20:00': self.send_evening_content
-        }
-        
-        for kemerovo_time, method in schedule_times.items():
-            server_time = self.convert_to_server_time(kemerovo_time)
-            trigger = CronTrigger(
-                hour=server_time.hour,
-                minute=server_time.minute,
-                timezone=self.server_tz
-            )
+        """Настройка планировщика"""
+        try:
+            self.scheduler = BackgroundScheduler(timezone=str(self.server_tz))
             
+            # Keep-alive задача каждые 10 минут
             self.scheduler.add_job(
-                method,
-                trigger=trigger,
-                id=f"post_{kemerovo_time}",
-                name=f"Публикация в {kemerovo_time} Кемерово"
+                self.keep_alive,
+                'interval',
+                minutes=10,
+                id='keep_alive'
             )
 
-        # Keep-alive задача каждые 10 минут
-        self.scheduler.add_job(
-            self.keep_alive,
-            'interval',
-            minutes=int(os.getenv('KEEP_ALIVE_INTERVAL', 10)),
-            id='keep_alive'
-        )
-
-        self.scheduler.start()
-        logger.info("Планировщик запущен с учетом таймзоны Кемерово")
+            self.scheduler.start()
+            logger.info("Scheduler started successfully")
+        except Exception as e:
+            logger.error(f"Error starting scheduler: {e}")
 
     def keep_alive(self):
-        """Keep-alive для предотвращения засыпания на Render"""
+        """Keep-alive для Render"""
         try:
-            health_url = os.getenv('HEALTH_CHECK_URL')
+            health_url = os.getenv('HEALTH_CHECK_URL', '')
             if health_url:
-                response = requests.get(health_url, timeout=10)
-                logger.info(f"Keep-alive запрос: {response.status_code}")
-            else:
-                logger.info("Keep-alive: приложение активно")
-        except Exception as e:
-            logger.warning(f"Keep-alive ошибка: {e}")
-
-    # === МЕТОДЫ ОТПРАВКИ КОНТЕНТА ===
-    async def send_daily_rule(self):
-        """Публикация правила дня в 08:30 Кемерово"""
-        try:
-            content = self._get_daily_rule_content()
-            if content:
-                await self._send_to_channel(content)
-                self._log_posting('daily_rule', content)
-        except Exception as e:
-            logger.error(f"Ошибка отправки правила дня: {e}")
-
-    async def send_morning_content(self):
-        """Публикация утреннего контента в 10:00 Кемерово"""
-        try:
-            content = self._get_morning_content()
-            if content:
-                await self._send_to_channel(content)
-                self._log_posting('morning_content', content)
-        except Exception as e:
-            logger.error(f"Ошибка отправки утреннего контента: {e}")
-
-    async def send_midday_content(self):
-        """Публикация дневного контента в 12:00 Кемерово"""
-        try:
-            content = self._get_midday_content()
-            if content:
-                await self._send_to_channel(content)
-                self._log_posting('midday_content', content)
-        except Exception as e:
-            logger.error(f"Ошибка отправки дневного контента: {e}")
-
-    async def send_tech_training(self):
-        """Публикация технической подготовки в 14:00 Кемерово"""
-        try:
-            content = self._get_tech_training_content()
-            if content:
-                await self._send_to_channel(content)
-                self._log_posting('tech_training', content)
-        except Exception as e:
-            logger.error(f"Ошибка отправки технической подготовки: {e}")
-
-    async def send_incident_analysis(self):
-        """Публикация анализа инцидентов в 16:00 Кемерово"""
-        try:
-            content = self._get_incident_analysis_content()
-            if content:
-                await self._send_to_channel(content)
-                self._log_posting('incident_analysis', content)
-        except Exception as e:
-            logger.error(f"Ошибка отправки анализа инцидентов: {e}")
-
-    async def send_psychology(self):
-        """Публикация психологии безопасности в 18:00 Кемерово"""
-        try:
-            content = self._get_psychology_content()
-            if content:
-                await self._send_to_channel(content)
-                self._log_posting('psychology', content)
-        except Exception as e:
-            logger.error(f"Ошибка отправки психологии безопасности: {e}")
-
-    async def send_evening_content(self):
-        """Публикация вечернего контента в 20:00 Кемерово"""
-        try:
-            content = self._get_evening_content()
-            if content:
-                await self._send_to_channel(content)
-                self._log_posting('evening_content', content)
-        except Exception as e:
-            logger.error(f"Ошибка отправки вечернего контента: {e}")
-
-    async def _send_to_channel(self, content):
-        """Отправка сообщения в канал"""
-        try:
-            if isinstance(content, tuple):
-                message, keyboard = content
-                await self.application.bot.send_message(
-                    chat_id=self.channel_id,
-                    text=message,
-                    reply_markup=keyboard,
-                    parse_mode='HTML'
-                )
-            else:
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💬 Комментарий", callback_data="comment")]
-                ])
-                await self.application.bot.send_message(
-                    chat_id=self.channel_id,
-                    text=content,
-                    reply_markup=keyboard,
-                    parse_mode='HTML'
-                )
+                requests.get(health_url, timeout=10)
+            logger.info("Keep-alive ping sent")
             
-            logger.info(f"Сообщение отправлено в канал")
+            # Также пингуем наш собственный эндпоинт
+            try:
+                requests.get(f"https://{os.getenv('RENDER_SERVICE_NAME', 'bezopasnostdvizenia')}.onrender.com/health", timeout=10)
+            except:
+                pass
+                
+        except Exception as e:
+            logger.warning(f"Keep-alive error: {e}")
+
+    async def send_manual_post(self, post_type: str, custom_text: str = None):
+        """Ручная отправка поста"""
+        try:
+            if post_type == 'custom' and custom_text:
+                content = custom_text
+            else:
+                content = self._get_content_by_type(post_type)
+            
+            if not content:
+                return "❌ Контент не найден"
+            
+            # Используем простую отправку без кнопок для теста
+            await self.bot.send_message(
+                chat_id=self.channel_id,
+                text=content,
+                parse_mode='HTML'
+            )
+            
+            # Логирование
+            self._log_posting(post_type, content, "manual")
+            self._update_stats()
+            
+            return f"✅ Сообщение отправлено в канал"
             
         except Exception as e:
-            logger.error(f"Ошибка отправки в канал: {e}")
+            error_msg = f"❌ Ошибка отправки: {str(e)}"
+            logger.error(error_msg)
+            return error_msg
 
-    def _log_posting(self, post_type: str, content: str):
-        """Логирование публикаций"""
+    def _get_content_by_type(self, post_type: str):
+        """Получение контента по типу"""
+        content_map = {
+            'daily_rule': self.content_db['daily_rules'].get(1),
+            'safety_number': self.content_db['safety_numbers'].get(1),
+            'tech_training': self.content_db['tech_training'].get(1),
+            'incident_analysis': self.content_db['incident_analysis'].get(1),
+            'psychology': self.content_db['psychology'].get(1),
+            'assistant_duties': self.content_db['assistant_duties'].get(1),
+        }
+        return content_map.get(post_type)
+
+    def _log_posting(self, post_type: str, content: str, trigger: str):
+        """Логирование публикации"""
         try:
             conn = sqlite3.connect('safety_bot.db', check_same_thread=False)
             cursor = conn.cursor()
             
             cursor.execute('''
-                INSERT INTO posting_logs (post_type, content, scheduled_time, actual_time, status)
+                INSERT INTO posting_logs (post_type, content, scheduled_time, status, message)
                 VALUES (?, ?, ?, ?, ?)
-            ''', (post_type, str(content)[:100], datetime.now(), datetime.now(), 'success'))
+            ''', (post_type, str(content)[:200], datetime.now(), 'success', f"Manual: {trigger}"))
             
             conn.commit()
             conn.close()
         except Exception as e:
-            logger.error(f"Ошибка логирования: {e}")
+            logger.error(f"Error logging: {e}")
 
-    # === ПОЛНЫЙ КОНТЕНТ НА 1 МЕСЯЦ ===
-    def _load_all_content(self) -> Dict:
-        """Загрузка всего контента для публикации"""
-        return {
-            'daily_rules': self._load_daily_rules(),
-            'safety_numbers': self._load_safety_numbers(),
-            'weekly_tasks': self._load_weekly_tasks(),
-            'tech_training': self._load_tech_training(),
-            'incident_analysis': self._load_incident_analysis(),
-            'psychology': self._load_psychology(),
-            'new_regulations': self._load_new_regulations(),
-            'express_tests': self._load_express_tests(),
-            'weekly_polls': self._load_weekly_polls(),
-            'assistant_duties': self._load_assistant_duties()
-        }
-
-    def _load_daily_rules(self) -> Dict:
-        return {
-            # НЕДЕЛЯ 1: Основы безопасности движения
-            1: "🚦 <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ п.12.1: Машинист обязан немедленно принимать меры к остановке при получении сигнала остановки или возникновении опасности для движения.",
-            2: "👀 <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ п.12.7: Машинист должен вести поезд, внимательно наблюдая за путем, показаниями приборов и сигналов.",
-            3: "🛑 <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ Прил.2: Перед отправлением поезда машинист обязан убедиться в правильности подготовки тормозов и опробованием проверить их действие.",
-            4: "🐢 <b>ПРАВИЛО ДНЯ</b>\n\nИДП п.12.5: Скорость движения при приеме на путь, где заняты соседние пути, не должна превышать 25 км/ч.",
-            5: "⚡ <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ п.12.11: При отказе автотормозов в поезде машинист обязан немедленно привести в действие вспомогательный тормоз локомотива.",
+    def _update_stats(self):
+        """Обновление статистики"""
+        try:
+            conn = sqlite3.connect('safety_bot.db', check_same_thread=False)
+            cursor = conn.cursor()
             
-            # НЕДЕЛЯ 2: Сигнализация и связь
-            6: "👋 <b>ПРАВИЛО ДНЯ</b>\n\nИДП п.35: Круглый щит красного цвета, красный флаг днем и красный огонь фонаря ночью на станции — СТОЙ!",
-            7: "📻 <b>ПРАВИЛО ДНЯ</b>\n\nИДП п.43: Все переговоры по радиосвязи должны вестись четко, без лишних слов, с обязательным названием своей должности.",
-            8: "📢 <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ Прил.3: Один длинный свисток — 'Отправление поезда'. Три коротких — 'Требование к помощнику машиниста затормозить'.",
-            9: "🔄 <b>ПРАВИЛО ДНЯ</b>\n\nИДП п.41: При маневрах сигналист должен быть виден ВСЕГДА. Если его не видно — СТОП.",
-            10: "🔥 <b>ПРАВИЛО ДНЯ</b>\n\nИДП п.12.12: При срабатывании УКСПС машинист обязан немедленно остановить поезд и осмотреть локомотив.",
-            
-            # НЕДЕЛЯ 3: Неисправности и отказы
-            11: "🏔️ <b>ПРАВИЛО ДНЯ</b>\n\nПравила №151: Запрещается выпускать локомотив из депо, если не работают песочницы для движения вперед.",
-            12: "💨 <b>ПРАВИЛО ДНЯ</b>\n\nИДП п.12.13: При частых самопроизвольных торможениях необходимо остановиться и проверить тормозную магистраль.",
-            13: "❄️ <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ п.12.18: При гололеде скорость должна быть снижена настолько, чтобы обеспечить остановку в пределах видимости.",
-            14: "🌫️ <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ п.12.7: При движении в туман, когда видимость менее 1000 м, машинист должен подавать оповестительный сигнал.",
-            15: "💨 <b>ПРАВИЛО ДНЯ</b>\n\nИнструкция по погоде: При скорости ветра свыше 25 м/с вводятся ограничения скорости для порожних вагонов.",
-            
-            # НЕДЕЛЯ 4: Зимняя эксплуатация
-            16: "🌨️ <b>ПРАВИЛО ДНЯ</b>\n\nПри снежных заносах скорость должна быть снижена, особое внимание - состоянию стрелочных переводов.",
-            17: "🧊 <b>ПРАВИЛО ДНЯ</b>\n\nПри температуре ниже -25°C обязательна проверка работы тормозного оборудования каждые 2 часа.",
-            18: "🌙 <b>ПРАВИЛО ДНЯ</b>\n\nПри маневрах в темное время суток скорость не более 15 км/ч, обязательное освещение рабочей зоны.",
-            19: "🛤️ <b>ПРАВИЛО ДНЯ</b>\n\nПри обледенении рельсов перед отправлением обязательно опробование тормозов с применением песка.",
-            20: "🚂 <b>ПРАВИЛО ДНЯ</b>\n\nПри следовании по заснеженным перегонам дистанция между поездами увеличивается на 20%."
-        }
+            cursor.execute('UPDATE bot_stats SET posts_sent = posts_sent + 1, last_activity = CURRENT_TIMESTAMP')
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error updating stats: {e}")
 
-    def _load_safety_numbers(self) -> Dict:
-        return {
-            1: "📊 <b>ЦИФРА БЕЗОПАСНОСТИ</b>\n\nОстановочный путь грузового поезда 6000т на спуске 10‰ при 70км/ч составляет ~1200 метров",
-            2: "⏱️ <b>ЦИФРА БЕЗОПАСНОСТИ</b>\n\nРеакция машиниста 1 секунда = 14 метров пути при скорости 50км/ч",
-            3: "🛑 <b>ЦИФРА БЕЗОПАСНОСТИ</b>\n\nВремя приведения в действие ручного тормоза вагона - 10-15 секунд",
-            4: "🔥 <b>ЦИФРА БЕЗОПАСНОСТИ</b>\n\nТемпература выпускных газов дизеля 2ТЭ10М достигает 400-500°C",
-            5: "💨 <b>ЦИФРА БЕЗОПАСНОСТИ</b>\n\nДавление в тормозной магистрали груженого поезда - 4,8-5,0 кгс/см²",
-            6: "❄️ <b>ЦИФРА БЕЗОПАСНОСТИ</b>\n\nСила сцепления на обледенелом рельсе снижается на 60-70%",
-            7: "🌨️ <b>ЦИФРА БЕЗОПАСНОСТИ</b>\n\nВидимость при сильном снегопаде 50м = максимальная скорость 25км/ч",
-            8: "🌡️ <b>ЦИФРА БЕЗОПАСНОСТИ</b>\n\nРасход топлива тепловозом на холостом ходу при -30°C увеличивается на 25%"
-        }
-
-    def _load_weekly_tasks(self) -> Dict:
-        return {
-            1: {
-                'question': "🚨 <b>СИТУАЦИОННАЯ ЗАДАЧА НЕДЕЛИ</b>\n\nСитуация: В пути следования у грузового поезда вы заметили, что стрелка манометра тормозной магистрали не возвращается в положение зарядного давления после торможения.\n\nВаши действия?",
-                'answer': "✅ <b>ПРАВИЛЬНЫЙ ОТВЕТ:</b>\n\n1. Немедленно подать сигнал общей тревоги\n2. Применить вспомогательный тормоз локомотива\n3. Остановить поезд на площадке\n4. Доложить поездному диспетчеру\n5. Принять меры к устранению неисправности"
-            },
-            2: {
-                'question': "🚨 <b>СИТУАЦИОННАЯ ЗАДАЧА НЕДЕЛИ</b>\n\nСитуация: При маневрах на грузовой станции у вас и у составителя поездов отказала радиосвязь.\n\nВаши действия?",
-                'answer': "✅ <b>ПРАВИЛЬНЫЙ ОТВЕТ:</b>\n\n1. Немедленно остановить маневры\n2. Подать сигнал 'общей тревоги'\n3. Установить связь через ДСП\n4. Продолжить ТОЛЬКО после организации надежной связи"
-            },
-            3: {
-                'question': "🚨 <b>СИТУАЦИОННАЯ ЗАДАЧА НЕДЕЛИ</b>\n\nСитуация: В пути следования на тепловозе 2ТЭ10М упало давление масла в дизеле до нижней допустимой отметки.\n\nВаши действия?",
-                'answer': "✅ <b>ПРАВИЛЬНЫЙ ОТВЕТ:</b>\n\n1. Немедленно снизить нагрузку дизеля\n2. Остановить поезд\n3. Выключить дизель\n4. Доложить диспетчеру\n5. Запрещается запуск до выяснения причины"
-            },
-            4: {
-                'question': "🚨 <b>СИТУАЦИОННАЯ ЗАДАЧА НЕДЕЛИ</b>\n\nСитуация: При следовании в условиях сильного снегопада и обледенения рельсов состав начал юзить.\n\nВаши действия?",
-                'answer': "✅ <b>ПРАВИЛЬНЫЙ ОТВЕТ:</b>\n\n1. Немедленно снизить скорость\n2. Применить песочницы\n3. Избегать резкого торможения\n4. Доложить диспетчеру о состоянии пути\n5. Следовать с повышенной бдительностью"
+    def get_stats(self):
+        """Получение статистики"""
+        try:
+            conn = sqlite3.connect('safety_bot.db', check_same_thread=False)
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT posts_sent FROM bot_stats')
+            posts_sent = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT * FROM posting_logs ORDER BY id DESC LIMIT 10')
+            recent_logs = [{
+                'timestamp': row[4].split('.')[0] if row[4] else 'N/A',
+                'message': f"{row[1]}: {row[6]}"
+            } for row in cursor.fetchall()]
+            
+            conn.close()
+            
+            return {
+                'posts_sent': posts_sent,
+                'recent_logs': recent_logs
             }
-        }
-
-    def _load_tech_training(self) -> Dict:
-        return {
-            1: "🔧 <b>ТЕХНИЧЕСКАЯ ПОДГОТОВКА: ТЭМ2</b>\n\nСистема управления РКСУ: Контроллер имеет 25 позиций. При переходе с позиции на позицию выдерживать паузу 2-3 секунды для снижения бросков тока.",
-            2: "🔧 <b>ТЕХНИЧЕСКАЯ ПОДГОТОВКА: 2ТЭ10М</b>\n\nДизель 10Д100: Критические параметры:\n- Давление масла: мин. 1,2 кгс/см²\n- Температура воды: макс. 90°C\n- Давление топлива: 8-10 кгс/см²",
-            3: "🔧 <b>ТЕХНИЧЕСКАЯ ПОДГОТОВКА: ТЭМ18ДМ</b>\n\nРеостатное торможение: Максимальная тормозная сила 20 тс. Не отключать вентиляторы тормозных резисторов. При отказе - переходить на пневматические тормоза.",
-            4: "🔧 <b>ТЕХНИЧЕСКАЯ ПОДГОТОВКА: 2ТЭ10У</b>\n\nТурбокомпрессор ТК-34: Признаки неисправности:\n- Повышенный расход масла\n- Дымный выхлоп\n- Снижение мощности дизеля\n- Шум при работе",
-            5: "🔧 <b>ТЕХНИЧЕСКАЯ ПОДГОТОВКА: ТЭМ2</b>\n\nТопливная система зимой: При температуре ниже -20°C обязателен подогрев топлива. Контроль фильтров тонкой очистки каждые 2 часа.",
-            6: "🔧 <b>ТЕХНИЧЕСКАЯ ПОДГОТОВКА: 2ТЭ10М</b>\n\nСистема охлаждения: При резком похолодании включать вентиляторы постепенно. Резкий перепад температур ведет к трещинам в трубках.",
-            7: "🔧 <b>ТЕХНИЧЕСКАЯ ПОДГОТОВКА: ТЭМ18ДМ</b>\n\nЭлектрические аппараты зимой: Повышенное внимание контакторам и реле. Образование инея может нарушить работу.",
-            8: "🔧 <b>ТЕХНИЧЕСКАЯ ПОДГОТОВКА: 2ТЭ10У</b>\n\nПодготовка к зиме: Проверка системы подогрева топлива, утепление аккумуляторных батарей, контроль состояния уплотнений."
-        }
-
-    def _load_incident_analysis(self) -> Dict:
-        return {
-            1: "🔍 <b>АНАЛИЗ ИНЦИДЕНТА</b>\n\nПроезд запрещающего сигнала маневровым тепловозом.\n<b>Цепочка ошибок:</b>\n1. Помощник машиниста отвлекся\n2. Машинист не проконтролировал\n<b>Вывод:</b> Соблюдение системы «Машинист-Помощник»",
-            2: "🔍 <b>АНАЛИЗ ИНЦИДЕНТА</b>\n\nСамопроизвольный уход подвижного состава.\n<b>Цепочка ошибок:</b>\n1. Недостаточное закрепление\n2. Отсутствие контроля\n<b>Вывод:</b> Личная проверка закрепления",
-            3: "🔍 <b>АНАЛИЗ ИНЦИДЕНТА</b>\n\nНарушение габарита погрузки.\n<b>Цепочка ошибок:</b>\n1. Не проведен визуальный контроль\n2. Проигнорированы предупреждения\n<b>Вывод:</b> Внимательный осмотр состава",
-            4: "🔍 <b>АНАЛИЗ ИНЦИДЕНТА</b>\n\nТравма при сцепке в зимних условиях.\n<b>Цепочка ошибок:</b>\n1. Не очищена рабочая зона ото льда\n2. Нарушена методика сцепки\n<b>Вывод:</b> Очистка территории и соблюдение ТБ"
-        }
-
-    def _load_psychology(self) -> Dict:
-        return {
-            1: "🧠 <b>ПСИХОЛОГИЯ БЕЗОПАСНОСТИ</b>\n\nЭффект многозадачности: Мозг переключается между задачами. При подходе к светофорам сведите отвлечения к минимуму.",
-            2: "🧠 <b>ПСИХОЛОГИЯ БЕЗОПАСНОСТИ</b>\n\nСиндром привыкания: После 1000 безопасных поездок риск воспринимается минимальным. Боритесь с этим мысленным моделированием опасностей.",
-            3: "🧠 <b>ПСИХОЛОГИЯ БЕЗОПАСНОСТИ</b>\n\nСлепота невнимания: Мозг фильтрует 'неважную' информацию. Consciously ищите потенциальные опасности.",
-            4: "🧠 <b>ПСИХОЛОГИЯ БЕЗОПАСНОСТИ</b>\n\nПроклятие знания: Опытный машинист ожидает, что все мыслят так же. Давайте полную информацию, даже если кажется очевидной.",
-            5: "🧠 <b>ПСИХОЛОГИЯ БЕЗОПАСНОСТИ</b>\n\nЗимняя усталость: Короткий световой день и холод повышают утомляемость. Увеличьте перерывы на отдых.",
-            6: "🧠 <b>ПСИХОЛОГИЯ БЕЗОПАСНОСТИ</b>\n\nЭффект туннельного зрения: При стрессе в сложных условиях сужается поле зрения. Сознательно расширяйте обзор.",
-            7: "🧠 <b>ПСИХОЛОГИЯ БЕЗОПАСНОСТИ</b>\n\nСезонная депрессия: Может снижать бдительность. Соблюдайте режим дня, используйте световые будильники.",
-            8: "🧠 <b>ПСИХОЛОГИЯ БЕЗОПАСНОСТИ</b>\n\nПринятие решений на морозе: Холод замедляет реакцию. Заранее продумывайте действия в типичных зимних ситуациях."
-        }
-
-    def _load_new_regulations(self) -> Dict:
-        return {
-            1: "📋 <b>НОВОЕ В НТД</b>\n\nОбновленная Инструкция по сигнализации (ИСИ). Основные изменения: уточнены сигналы при маневрах с использованием радиосвязи.",
-            2: "📋 <b>НОВОЕ В НТД</b>\n\nПоправки в ПТЭ: При отказе САУТ в пути следования необходимо немедленно информировать поездного диспетчера.",
-            3: "📋 <b>НОВОЕ В НТД</b>\n\nИзменения в порядке медосмотров: Увеличен перечень обязательных исследований для машинистов.",
-            4: "📋 <b>НОВОЕ В НТД</b>\n\nЗимние инструкции: Введены дополнительные требования к осмотру путевых устройств при температуре ниже -25°C."
-        }
-
-    def _load_express_tests(self) -> Dict:
-        return {
-            1: {
-                'question': "❓ <b>ЭКСПРЕСС-ТЕСТ</b>\n\nПри каком давлении масла в дизеле 10Д100 требуется немедленная остановка?",
-                'options': [
-                    "1,0 кгс/см²",
-                    "1,2 кгс/см²", 
-                    "1,5 кгс/см²",
-                    "2,0 кгс/см²"
-                ],
-                'correct_answer': 1,
-                'explanation': "✅ Правильно! Минимальное допустимое давление масла в дизеле 10Д100 - 1,2 кгс/см²"
-            },
-            2: {
-                'question': "❓ <b>ЭКСПРЕСС-ТЕСТ</b>\n\nСколько тормозных башмаков требуется для закрепления состава из 50 вагонов?",
-                'options': [
-                    "2 башмака",
-                    "4 башмака",
-                    "6 башмаков", 
-                    "8 башмаков"
-                ],
-                'correct_answer': 2,
-                'explanation': "✅ Верно! Для состава до 100 вагонов требуется 6 тормозных башмаков"
-            },
-            3: {
-                'question': "❓ <b>ЭКСПРЕСС-ТЕСТ</b>\n\nКакая максимальная скорость при маневрах в темное время суток?",
-                'options': [
-                    "25 км/ч",
-                    "20 км/ч",
-                    "15 км/ч",
-                    "10 км/ч"
-                ],
-                'correct_answer': 2,
-                'explanation': "✅ Правильно! При маневрах в темное время суток скорость не более 15 км/ч"
-            },
-            4: {
-                'question': "❓ <b>ЭКСПРЕСС-ТЕСТ</b>\n\nПри какой температуре обязательна проверка тормозов каждые 2 часа?",
-                'options': [
-                    "Ниже -15°C",
-                    "Ниже -20°C", 
-                    "Ниже -25°C",
-                    "Ниже -30°C"
-                ],
-                'correct_answer': 2,
-                'explanation': "✅ Верно! При температуре ниже -25°C обязательна проверка тормозного оборудования каждые 2 часа"
-            }
-        }
-
-    def _load_weekly_polls(self) -> Dict:
-        return {
-            1: {
-                'question': "📊 <b>ОПРОС НЕДЕЛИ</b>\n\nКакой порядок действий при отказе автотормозов в пути следования?",
-                'options': [
-                    "Тормозить вспомогательным, потом общая тревога",
-                    "Общая тревога, потом вспомогательный тормоз",
-                    "Сразу остановка любым способом",
-                    "Продолжать движение до станции"
-                ],
-                'correct_answer': 1
-            },
-            2: {
-                'question': "📊 <b>ОПРОС НЕДЕЛИ</b>\n\nЧто делать при срабатывании УКСПС 'Пожар'?",
-                'options': [
-                    "Продолжать движение до станции",
-                    "Немедленно остановиться и осмотреть",
-                    "Снизить скорость и доложить",
-                    "Отключить сигнализацию"
-                ],
-                'correct_answer': 1
-            },
-            3: {
-                'question': "📊 <b>ОПРОС НЕДЕЛИ</b>\n\nКак действовать при отказе радиосвязи при маневрах?",
-                'options': [
-                    "Продолжать маневры как обычно",
-                    "Остановиться и установить связь",
-                    "Подавать сигналы свистком",
-                    "Работать по памяти"
-                ],
-                'correct_answer': 1
-            },
-            4: {
-                'question': "📊 <b>ОПРОС НЕДЕЛИ</b>\n\nПри обледенении рельсов что делать?",
-                'options': [
-                    "Увеличить скорость",
-                    "Применить песок и снизить скорость",
-                    "Резко затормозить",
-                    "Продолжать как обычно"
-                ],
-                'correct_answer': 1
-            }
-        }
-
-    def _load_assistant_duties(self) -> Dict:
-        return {
-            1: "👨‍💼 <b>ОБЯЗАННОСТИ ПОМОЩНИКА МАШИНИСТА</b>\n\nПри маневрах:\n• Контролировать свободность пути\n• Подавать четкие сигналы машинисту\n• Следить за габаритами подвижного состава\n• Контролировать сцепку и расцепку",
-            2: "👨‍💼 <b>ОБЯЗАННОСТИ ПОМОЩНИКА МАШИНИСТА</b>\n\nЗакрепление состава:\n• Правильная установка башмаков\n• Контроль ручных тормозов\n• Проверка надежности закрепления\n• Доклад машинисту о готовности",
-            3: "👨‍💼 <b>ОБЯЗАННОСТИ ПОМОЩНИКА МАШИНИСТА</b>\n\nЗимний период:\n• Очистка автосцепки ото льда\n• Контроль обледенения тормозных рукавов\n• Проверка работы песочниц\n• Осмотр путевых устройств",
-            4: "👨‍💼 <b>ОБЯЗАННОСТИ ПОМОЩНИКА МАШИНИСТА</b>\n\nТехника безопасности:\n• Не находиться в опасной зоне при маневрах\n• Использовать СИЗ при сцепке\n• Контролировать видимость сигналиста\n• Соблюдать дистанцию до движущегося состава"
-        }
-
-    # === МЕТОДЫ ПОЛУЧЕНИЯ КОНТЕНТА ===
-    def _get_daily_rule_content(self):
-        """Получение правила дня для текущего дня"""
-        day_of_week = datetime.now(self.target_tz).weekday() + 1  # 1-5 Пн-Пт
-        week_of_month = self._get_week_of_month()
-        rule_number = (week_of_month - 1) * 5 + day_of_week
-        
-        content = self.content_db['daily_rules'].get(rule_number)
-        if content:
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💬 Комментарий", callback_data="comment")]
-            ])
-            return content, keyboard
-        return None
-
-    def _get_morning_content(self):
-        """Получение утреннего контента (цифры/тесты)"""
-        week_of_month = self._get_week_of_month()
-        day_of_week = datetime.now(self.target_tz).weekday() + 1
-        
-        if day_of_week in [2, 4]:  # Вторник, Четверг - тесты
-            test_data = self.content_db['express_tests'].get(week_of_month)
-            if test_data:
-                keyboard = [
-                    [InlineKeyboardButton(option, callback_data=f"test_{week_of_month}_{i}")]
-                    for i, option in enumerate(test_data['options'])
-                ]
-                keyboard.append([InlineKeyboardButton("💬 Комментарий", callback_data="comment")])
-                return test_data['question'], InlineKeyboardMarkup(keyboard)
-        
-        # Понедельник, Среда, Пятница - цифры
-        number_data = self.content_db['safety_numbers'].get(week_of_month)
-        if number_data:
-            keyboard = [[InlineKeyboardButton("💬 Комментарий", callback_data="comment")]]
-            return number_data, InlineKeyboardMarkup(keyboard)
-        
-        return None
-
-    def _get_midday_content(self):
-        """Получение дневного контента (задачи/опросы)"""
-        week_of_month = self._get_week_of_month()
-        day_of_week = datetime.now(self.target_tz).weekday() + 1
-        
-        if day_of_week == 5:  # Пятница - опрос
-            poll_data = self.content_db['weekly_polls'].get(week_of_month)
-            if poll_data:
-                keyboard = [
-                    [InlineKeyboardButton(option, callback_data=f"poll_{week_of_month}_{i}")]
-                    for i, option in enumerate(poll_data['options'])
-                ]
-                keyboard.append([InlineKeyboardButton("💬 Комментарий", callback_data="comment")])
-                return poll_data['question'], InlineKeyboardMarkup(keyboard)
-        
-        # Пн-Чт - ситуационные задачи
-        task_data = self.content_db['weekly_tasks'].get(week_of_month)
-        if task_data:
-            if day_of_week in [1, 2, 3, 4]:  # Понедельник-Четверг - вопрос
-                keyboard = [[InlineKeyboardButton("💬 Комментарий", callback_data="comment")]]
-                return task_data['question'], InlineKeyboardMarkup(keyboard)
-        
-        return None
-
-    def _get_tech_training_content(self):
-        """Получение технической подготовки"""
-        week_of_month = self._get_week_of_month()
-        day_of_month = datetime.now(self.target_tz).day
-        tech_number = (week_of_month - 1) * 2 + (day_of_month % 2) + 1
-        
-        tech_data = self.content_db['tech_training'].get(tech_number)
-        if tech_data:
-            keyboard = [[InlineKeyboardButton("💬 Комментарий", callback_data="comment")]]
-            return tech_data, InlineKeyboardMarkup(keyboard)
-        return None
-
-    def _get_incident_analysis_content(self):
-        """Получение анализа инцидентов"""
-        week_of_month = self._get_week_of_month()
-        incident_data = self.content_db['incident_analysis'].get(week_of_month)
-        if incident_data:
-            keyboard = [[InlineKeyboardButton("💬 Комментарий", callback_data="comment")]]
-            return incident_data, InlineKeyboardMarkup(keyboard)
-        return None
-
-    def _get_psychology_content(self):
-        """Получение психологии безопасности"""
-        day_of_week = datetime.now(self.target_tz).weekday() + 1
-        week_of_month = self._get_week_of_month()
-        psych_number = (week_of_month - 1) * 5 + day_of_week
-        
-        psych_data = self.content_db['psychology'].get(psych_number)
-        if psych_data:
-            keyboard = [[InlineKeyboardButton("💬 Комментарий", callback_data="comment")]]
-            return psych_data, InlineKeyboardMarkup(keyboard)
-        return None
-
-    def _get_evening_content(self):
-        """Получение вечернего контента"""
-        week_of_month = self._get_week_of_month()
-        day_of_week = datetime.now(self.target_tz).weekday() + 1
-        
-        if day_of_week == 1:  # Понедельник - новые нормативы
-            regulation_data = self.content_db['new_regulations'].get(week_of_month)
-            if regulation_data:
-                keyboard = [[InlineKeyboardButton("💬 Комментарий", callback_data="comment")]]
-                return regulation_data, InlineKeyboardMarkup(keyboard)
-        
-        # Среда - обязанности помощника
-        if day_of_week == 3:
-            assistant_data = self.content_db['assistant_duties'].get(week_of_month)
-            if assistant_data:
-                keyboard = [[InlineKeyboardButton("💬 Комментарий", callback_data="comment")]]
-                return assistant_data, InlineKeyboardMarkup(keyboard)
-        
-        return None
-
-    def _get_week_of_month(self) -> int:
-        """Определение недели месяца в таймзоне Кемерово"""
-        today = datetime.now(self.target_tz)
-        first_day = today.replace(day=1)
-        dom = today.day
-        adjusted_dom = dom + first_day.weekday()
-        return (adjusted_dom - 1) // 7 + 1
-
-    def setup_handlers(self):
-        """Настройка обработчиков Telegram"""
-        self.application.add_handler(CallbackQueryHandler(self.handle_callback))
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(CommandHandler("schedule", self.schedule_command))
-        self.application.add_handler(CommandHandler("test", self.test_command))
-
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /start"""
-        current_time_kemerovo = datetime.now(self.target_tz).strftime('%H:%M')
-        current_time_utc = datetime.now(self.server_tz).strftime('%H:%M')
-        
-        await update.message.reply_text(
-            f"🚂 Безопасность движения РЖД\n\n"
-            f"⏰ Текущее время:\n"
-            f"Кемерово: {current_time_kemerovo} (UTC+7)\n"
-            f"Сервер: {current_time_utc} UTC\n\n"
-            f"Расписание публикаций (время Кемерово):\n"
-            f"08:30 - Правило дня\n"
-            f"10:00 - Цифры безопасности\n"
-            f"12:00 - Ситуационные задачи\n"
-            f"14:00 - Техническая подготовка\n"
-            f"16:00 - Анализ инцидентов\n"
-            f"18:00 - Психология безопасности\n"
-            f"20:00 - Новое в НТД (пн)\n\n"
-            f"Канал: @BezopasnostDvizenia_bot"
-        )
-
-    async def schedule_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать расписание с временными зонами"""
-        schedule_text = """
-📅 <b>РАСПИСАНИЕ ПУБЛИКАЦИЙ</b>
-
-⏰ <i>Время указано для Кемерово (UTC+7)</i>
-
-08:30 🚦 - Правило дня (ПТЭ/ИДП)
-10:00 📊 - Цифры безопасности / Тесты
-12:00 🚨 - Ситуационные задачи / Опросы
-14:00 🔧 - Техническая подготовка
-16:00 🔍 - Анализ инцидентов  
-18:00 🧠 - Психология безопасности
-20:00 📋 - Новое в НТД (по понедельникам)
-
-<b>Серверное время:</b> UTC
-<b>Целевое время:</b> Кемерово UTC+7
-"""
-        await update.message.reply_text(schedule_text, parse_mode='HTML')
-
-    async def test_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Тестовая команда для проверки бота"""
-        await update.message.reply_text(
-            "✅ Бот работает корректно!\n"
-            f"Канал: {self.channel_id}\n"
-            f"Таймзона: Кемерово (UTC+7)"
-        )
-
-    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик callback'ов"""
-        query = update.callback_query
-        await query.answer()
-        
-        callback_data = query.data
-        
-        if callback_data.startswith('test_'):
-            _, week, answer = callback_data.split('_')
-            week = int(week)
-            answer = int(answer)
-            
-            test_data = self.content_db['express_tests'].get(week)
-            if test_data:
-                if answer == test_data['correct_answer']:
-                    message = f"{test_data['explanation']}\n\n✅ Вы ответили правильно!"
-                else:
-                    correct_option = test_data['options'][test_data['correct_answer']]
-                    message = f"❌ Неправильно. Правильный ответ: {correct_option}\n\n{test_data['explanation']}"
-                
-                await query.edit_message_text(
-                    text=message,
-                    parse_mode='HTML'
-                )
-        
-        elif callback_data.startswith('poll_'):
-            _, week, answer = callback_data.split('_')
-            week = int(week)
-            answer = int(answer)
-            
-            poll_data = self.content_db['weekly_polls'].get(week)
-            if poll_data:
-                selected_option = poll_data['options'][answer]
-                if answer == poll_data['correct_answer']:
-                    message = f"✅ Вы выбрали правильный вариант: {selected_option}"
-                else:
-                    correct_option = poll_data['options'][poll_data['correct_answer']]
-                    message = f"❌ Вы выбрали: {selected_option}\n\nПравильный ответ: {correct_option}"
-                
-                await query.edit_message_text(
-                    text=f"{poll_data['question']}\n\n{message}",
-                    parse_mode='HTML'
-                )
-        
-        elif callback_data == 'comment':
-            await query.edit_message_text(
-                text=query.message.text + "\n\n💬 <b>Для комментариев напишите сообщение в чат</b>",
-                parse_mode='HTML'
-            )
+        except Exception as e:
+            logger.error(f"Error getting stats: {e}")
+            return {'posts_sent': 0, 'recent_logs': []}
 
 # Глобальный экземпляр
 safety_manager = SafetyContentManager()
 
+# ==================== FLASK ROUTES ====================
+
 @app.route('/')
-def home():
-    current_time_utc = datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
-    current_time_kemerovo = datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%Y-%m-%d %H:%M:%S UTC+7')
+def dashboard():
+    """Главный дашборд"""
+    stats = safety_manager.get_stats()
     
-    return jsonify({
-        "status": "active",
-        "service": "RZD Safety Bot",
-        "version": "1.0.0",
-        "channel": "@BezopasnostDvizenia_bot",
-        "timezone": {
-            "server": "UTC",
-            "target": "Asia/Novokuznetsk (UTC+7)",
-            "current_utc": current_time_utc,
-            "current_kemerovo": current_time_kemerovo
-        }
-    })
-
-@app.route('/health')
-def health_check():
-    return jsonify({
-        "status": "healthy", 
-        "timestamp": datetime.now().isoformat(),
-        "timezone": "UTC"
-    })
-
-@app.route('/schedule')
-def show_schedule():
-    """Показать текущее расписание"""
-    jobs = []
+    # Получение запланированных заданий
+    scheduled_jobs = []
     if hasattr(safety_manager, 'scheduler'):
         for job in safety_manager.scheduler.get_jobs():
-            jobs.append({
-                "id": job.id,
-                "name": job.name,
-                "next_run": str(job.next_run_time)
+            scheduled_jobs.append({
+                'name': job.name,
+                'next_run': job.next_run_time.strftime('%Y-%m-%d %H:%M:%S') if job.next_run_time else 'N/A'
             })
     
-    return jsonify({
-        "timezone": "UTC",
-        "target_timezone": "Asia/Novokuznetsk (UTC+7)",
-        "scheduled_jobs": jobs
-    })
+    return render_template_string(DASHBOARD_HTML,
+        bot_status=getattr(safety_manager, 'bot_status', 'error'),
+        channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
+        jobs_count=len(scheduled_jobs),
+        posts_sent=stats['posts_sent'],
+        current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
+        current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
+        scheduled_jobs=scheduled_jobs,
+        recent_logs=stats['recent_logs'],
+        message=request.args.get('message', ''),
+        message_type=request.args.get('type', 'success')
+    )
 
-@app.route('/ping')
-def ping():
-    return jsonify({"status": "pong", "timestamp": datetime.now().isoformat()})
+@app.route('/send-manual', methods=['POST'])
+def send_manual():
+    """Ручная отправка сообщения"""
+    post_type = request.form.get('post_type')
+    custom_text = request.form.get('custom_text', '')
+    
+    if not post_type:
+        return render_template_string(DASHBOARD_HTML, 
+            bot_status=getattr(safety_manager, 'bot_status', 'error'),
+            message="❌ Не указан тип поста",
+            message_type="danger"
+        )
+    
+    try:
+        # Запускаем асинхронную функцию
+        result = asyncio.run(safety_manager.send_manual_post(post_type, custom_text))
+        
+        if "✅" in result:
+            return render_template_string(DASHBOARD_HTML,
+                bot_status=getattr(safety_manager, 'bot_status', 'error'),
+                channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
+                jobs_count=0,
+                posts_sent=safety_manager.get_stats()['posts_sent'],
+                current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
+                current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
+                scheduled_jobs=[],
+                recent_logs=safety_manager.get_stats()['recent_logs'],
+                message=result,
+                message_type="success"
+            )
+        else:
+            return render_template_string(DASHBOARD_HTML,
+                bot_status=getattr(safety_manager, 'bot_status', 'error'),
+                channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
+                jobs_count=0,
+                posts_sent=safety_manager.get_stats()['posts_sent'],
+                current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
+                current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
+                scheduled_jobs=[],
+                recent_logs=safety_manager.get_stats()['recent_logs'],
+                message=result,
+                message_type="danger"
+            )
+            
+    except Exception as e:
+        return render_template_string(DASHBOARD_HTML,
+            bot_status=getattr(safety_manager, 'bot_status', 'error'),
+            channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
+            jobs_count=0,
+            posts_sent=safety_manager.get_stats()['posts_sent'],
+            current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
+            current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
+            scheduled_jobs=[],
+            recent_logs=safety_manager.get_stats()['recent_logs'],
+            message=f"❌ Ошибка: {str(e)}",
+            message_type="danger"
+        )
+
+@app.route('/test-connection')
+def test_connection():
+    """Тестирование подключения к каналу"""
+    try:
+        asyncio.run(safety_manager.test_channel_connection())
+        return render_template_string(DASHBOARD_HTML,
+            bot_status=getattr(safety_manager, 'bot_status', 'error'),
+            channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
+            jobs_count=0,
+            posts_sent=safety_manager.get_stats()['posts_sent'],
+            current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
+            current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
+            scheduled_jobs=[],
+            recent_logs=safety_manager.get_stats()['recent_logs'],
+            message="✅ Тест подключения выполнен",
+            message_type="success"
+        )
+    except Exception as e:
+        return render_template_string(DASHBOARD_HTML,
+            bot_status=getattr(safety_manager, 'bot_status', 'error'),
+            channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
+            jobs_count=0,
+            posts_sent=safety_manager.get_stats()['posts_sent'],
+            current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
+            current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
+            scheduled_jobs=[],
+            recent_logs=safety_manager.get_stats()['recent_logs'],
+            message=f"❌ Ошибка теста: {str(e)}",
+            message_type="danger"
+        )
+
+@app.route('/force-schedule')
+def force_schedule():
+    """Принудительный запуск всех заданий"""
+    try:
+        # Отправляем тестовое сообщение
+        asyncio.run(safety_manager.send_manual_post('daily_rule'))
+        
+        return render_template_string(DASHBOARD_HTML,
+            bot_status=getattr(safety_manager, 'bot_status', 'error'),
+            channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
+            jobs_count=0,
+            posts_sent=safety_manager.get_stats()['posts_sent'],
+            current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
+            current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
+            scheduled_jobs=[],
+            recent_logs=safety_manager.get_stats()['recent_logs'],
+            message="✅ Тестовое сообщение отправлено",
+            message_type="success"
+        )
+    except Exception as e:
+        return render_template_string(DASHBOARD_HTML,
+            bot_status=getattr(safety_manager, 'bot_status', 'error'),
+            channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
+            jobs_count=0,
+            posts_sent=safety_manager.get_stats()['posts_sent'],
+            current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
+            current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
+            scheduled_jobs=[],
+            recent_logs=safety_manager.get_stats()['recent_logs'],
+            message=f"❌ Ошибка: {str(e)}",
+            message_type="danger"
+        )
+
+@app.route('/clear-logs')
+def clear_logs():
+    """Очистка логов"""
+    try:
+        conn = sqlite3.connect('safety_bot.db', check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM posting_logs')
+        cursor.execute('UPDATE bot_stats SET posts_sent = 0')
+        conn.commit()
+        conn.close()
+        
+        return render_template_string(DASHBOARD_HTML,
+            bot_status=getattr(safety_manager, 'bot_status', 'error'),
+            channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
+            jobs_count=0,
+            posts_sent=0,
+            current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
+            current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
+            scheduled_jobs=[],
+            recent_logs=[],
+            message="✅ Логи очищены",
+            message_type="success"
+        )
+    except Exception as e:
+        return render_template_string(DASHBOARD_HTML,
+            bot_status=getattr(safety_manager, 'bot_status', 'error'),
+            channel_status=getattr(safety_manager, 'channel_status', 'Не проверен'),
+            jobs_count=0,
+            posts_sent=safety_manager.get_stats()['posts_sent'],
+            current_time_utc=datetime.now(pytz.UTC).strftime('%H:%M:%S'),
+            current_time_kemerovo=datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%H:%M:%S'),
+            scheduled_jobs=[],
+            recent_logs=safety_manager.get_stats()['recent_logs'],
+            message=f"❌ Ошибка очистки: {str(e)}",
+            message_type="danger"
+        )
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
+
+@app.route('/config')
+def config():
+    """Проверка конфигурации"""
+    config_status = {
+        "TELEGRAM_BOT_TOKEN": "✅ SET" if os.getenv('TELEGRAM_BOT_TOKEN') else "❌ MISSING",
+        "TELEGRAM_CHANNEL_ID": "✅ SET" if os.getenv('TELEGRAM_CHANNEL_ID') else "❌ MISSING",
+        "bot_status": getattr(safety_manager, 'bot_status', 'unknown'),
+        "channel_status": getattr(safety_manager, 'channel_status', 'unknown')
+    }
+    return jsonify(config_status)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
