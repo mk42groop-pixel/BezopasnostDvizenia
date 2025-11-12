@@ -1,12 +1,18 @@
 import os
-import asyncio
 import logging
+import asyncio
+import threading
+import time
 from datetime import datetime, timedelta
-from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from flask import Flask, request, jsonify
 import sqlite3
 from typing import Dict, List, Tuple, Optional
-import time
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import requests
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # Настройка логирования
 logging.basicConfig(
@@ -15,23 +21,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key')
+
 class SafetyContentManager:
     def __init__(self):
         self.bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.channel_id = os.getenv('TELEGRAM_CHANNEL_ID')
         
+        # Настройка таймзон
+        self.server_tz = pytz.timezone(os.getenv('SERVER_TIMEZONE', 'UTC'))
+        self.target_tz = pytz.timezone(os.getenv('TARGET_TIMEZONE', 'Asia/Novokuznetsk'))
+        
         if not self.bot_token or not self.channel_id:
             logger.error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL_ID must be set")
-            raise ValueError("Missing required environment variables")
+            return
         
-        # Инициализация базы данных
+        self.application = Application.builder().token(self.bot_token).build()
         self.init_db()
-        
-        # База данных контента
         self.content_db = self._load_all_content()
-
+        self.setup_handlers()
+        self.setup_scheduler()
+        
     def init_db(self):
-        """Инициализация базы данных для хранения ответов"""
+        """Инициализация базы данных"""
         try:
             conn = sqlite3.connect('safety_bot.db', check_same_thread=False)
             cursor = conn.cursor()
@@ -47,11 +60,12 @@ class SafetyContentManager:
             ''')
             
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS brigade_scores (
-                    brigade_name TEXT,
-                    user_id INTEGER,
-                    score INTEGER DEFAULT 0,
-                    week_number INTEGER
+                CREATE TABLE IF NOT EXISTS posting_logs (
+                    post_type TEXT,
+                    content TEXT,
+                    scheduled_time DATETIME,
+                    actual_time DATETIME,
+                    status TEXT
                 )
             ''')
             
@@ -61,6 +75,195 @@ class SafetyContentManager:
         except Exception as e:
             logger.error(f"Error initializing database: {e}")
 
+    def convert_to_server_time(self, kemerovo_time_str: str) -> datetime:
+        """Конвертирует время Кемерово (UTC+7) во время сервера (UTC)"""
+        try:
+            kemerovo_time = datetime.strptime(kemerovo_time_str, '%H:%M').time()
+            now = datetime.now(self.target_tz)
+            kemerovo_dt = self.target_tz.localize(
+                datetime.combine(now.date(), kemerovo_time)
+            )
+            server_dt = kemerovo_dt.astimezone(self.server_tz)
+            
+            logger.info(f"Время Кемерово {kemerovo_time_str} -> Серверное время {server_dt.strftime('%H:%M')}")
+            return server_dt
+            
+        except Exception as e:
+            logger.error(f"Ошибка конвертации времени: {e}")
+            return datetime.strptime(kemerovo_time_str, '%H:%M').replace(
+                year=datetime.now().year,
+                month=datetime.now().month,
+                day=datetime.now().day
+            )
+
+    def setup_scheduler(self):
+        """Настройка планировщика с учетом таймзоны Кемерово"""
+        self.scheduler = BackgroundScheduler(timezone=str(self.server_tz))
+        
+        # Расписание публикаций (время Кемерово UTC+7)
+        schedule_times = {
+            '08:30': self.send_daily_rule,
+            '10:00': self.send_morning_content,
+            '12:00': self.send_midday_content, 
+            '14:00': self.send_tech_training,
+            '16:00': self.send_incident_analysis,
+            '18:00': self.send_psychology,
+            '20:00': self.send_evening_content
+        }
+        
+        for kemerovo_time, method in schedule_times.items():
+            server_time = self.convert_to_server_time(kemerovo_time)
+            trigger = CronTrigger(
+                hour=server_time.hour,
+                minute=server_time.minute,
+                timezone=self.server_tz
+            )
+            
+            self.scheduler.add_job(
+                method,
+                trigger=trigger,
+                id=f"post_{kemerovo_time}",
+                name=f"Публикация в {kemerovo_time} Кемерово"
+            )
+
+        # Keep-alive задача каждые 10 минут
+        self.scheduler.add_job(
+            self.keep_alive,
+            'interval',
+            minutes=int(os.getenv('KEEP_ALIVE_INTERVAL', 10)),
+            id='keep_alive'
+        )
+
+        self.scheduler.start()
+        logger.info("Планировщик запущен с учетом таймзоны Кемерово")
+
+    def keep_alive(self):
+        """Keep-alive для предотвращения засыпания на Render"""
+        try:
+            health_url = os.getenv('HEALTH_CHECK_URL')
+            if health_url:
+                response = requests.get(health_url, timeout=10)
+                logger.info(f"Keep-alive запрос: {response.status_code}")
+            else:
+                logger.info("Keep-alive: приложение активно")
+        except Exception as e:
+            logger.warning(f"Keep-alive ошибка: {e}")
+
+    # === МЕТОДЫ ОТПРАВКИ КОНТЕНТА ===
+    async def send_daily_rule(self):
+        """Публикация правила дня в 08:30 Кемерово"""
+        try:
+            content = self._get_daily_rule_content()
+            if content:
+                await self._send_to_channel(content)
+                self._log_posting('daily_rule', content)
+        except Exception as e:
+            logger.error(f"Ошибка отправки правила дня: {e}")
+
+    async def send_morning_content(self):
+        """Публикация утреннего контента в 10:00 Кемерово"""
+        try:
+            content = self._get_morning_content()
+            if content:
+                await self._send_to_channel(content)
+                self._log_posting('morning_content', content)
+        except Exception as e:
+            logger.error(f"Ошибка отправки утреннего контента: {e}")
+
+    async def send_midday_content(self):
+        """Публикация дневного контента в 12:00 Кемерово"""
+        try:
+            content = self._get_midday_content()
+            if content:
+                await self._send_to_channel(content)
+                self._log_posting('midday_content', content)
+        except Exception as e:
+            logger.error(f"Ошибка отправки дневного контента: {e}")
+
+    async def send_tech_training(self):
+        """Публикация технической подготовки в 14:00 Кемерово"""
+        try:
+            content = self._get_tech_training_content()
+            if content:
+                await self._send_to_channel(content)
+                self._log_posting('tech_training', content)
+        except Exception as e:
+            logger.error(f"Ошибка отправки технической подготовки: {e}")
+
+    async def send_incident_analysis(self):
+        """Публикация анализа инцидентов в 16:00 Кемерово"""
+        try:
+            content = self._get_incident_analysis_content()
+            if content:
+                await self._send_to_channel(content)
+                self._log_posting('incident_analysis', content)
+        except Exception as e:
+            logger.error(f"Ошибка отправки анализа инцидентов: {e}")
+
+    async def send_psychology(self):
+        """Публикация психологии безопасности в 18:00 Кемерово"""
+        try:
+            content = self._get_psychology_content()
+            if content:
+                await self._send_to_channel(content)
+                self._log_posting('psychology', content)
+        except Exception as e:
+            logger.error(f"Ошибка отправки психологии безопасности: {e}")
+
+    async def send_evening_content(self):
+        """Публикация вечернего контента в 20:00 Кемерово"""
+        try:
+            content = self._get_evening_content()
+            if content:
+                await self._send_to_channel(content)
+                self._log_posting('evening_content', content)
+        except Exception as e:
+            logger.error(f"Ошибка отправки вечернего контента: {e}")
+
+    async def _send_to_channel(self, content):
+        """Отправка сообщения в канал"""
+        try:
+            if isinstance(content, tuple):
+                message, keyboard = content
+                await self.application.bot.send_message(
+                    chat_id=self.channel_id,
+                    text=message,
+                    reply_markup=keyboard,
+                    parse_mode='HTML'
+                )
+            else:
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💬 Комментарий", callback_data="comment")]
+                ])
+                await self.application.bot.send_message(
+                    chat_id=self.channel_id,
+                    text=content,
+                    reply_markup=keyboard,
+                    parse_mode='HTML'
+                )
+            
+            logger.info(f"Сообщение отправлено в канал")
+            
+        except Exception as e:
+            logger.error(f"Ошибка отправки в канал: {e}")
+
+    def _log_posting(self, post_type: str, content: str):
+        """Логирование публикаций"""
+        try:
+            conn = sqlite3.connect('safety_bot.db', check_same_thread=False)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO posting_logs (post_type, content, scheduled_time, actual_time, status)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (post_type, str(content)[:100], datetime.now(), datetime.now(), 'success'))
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Ошибка логирования: {e}")
+
+    # === ПОЛНЫЙ КОНТЕНТ НА 1 МЕСЯЦ ===
     def _load_all_content(self) -> Dict:
         """Загрузка всего контента для публикации"""
         return {
@@ -78,28 +281,28 @@ class SafetyContentManager:
 
     def _load_daily_rules(self) -> Dict:
         return {
-            # Неделя 1: Основы безопасности движения
+            # НЕДЕЛЯ 1: Основы безопасности движения
             1: "🚦 <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ п.12.1: Машинист обязан немедленно принимать меры к остановке при получении сигнала остановки или возникновении опасности для движения.",
             2: "👀 <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ п.12.7: Машинист должен вести поезд, внимательно наблюдая за путем, показаниями приборов и сигналов.",
             3: "🛑 <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ Прил.2: Перед отправлением поезда машинист обязан убедиться в правильности подготовки тормозов и опробованием проверить их действие.",
             4: "🐢 <b>ПРАВИЛО ДНЯ</b>\n\nИДП п.12.5: Скорость движения при приеме на путь, где заняты соседние пути, не должна превышать 25 км/ч.",
             5: "⚡ <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ п.12.11: При отказе автотормозов в поезде машинист обязан немедленно привести в действие вспомогательный тормоз локомотива.",
             
-            # Неделя 2: Сигнализация и связь
+            # НЕДЕЛЯ 2: Сигнализация и связь
             6: "👋 <b>ПРАВИЛО ДНЯ</b>\n\nИДП п.35: Круглый щит красного цвета, красный флаг днем и красный огонь фонаря ночью на станции — СТОЙ!",
             7: "📻 <b>ПРАВИЛО ДНЯ</b>\n\nИДП п.43: Все переговоры по радиосвязи должны вестись четко, без лишних слов, с обязательным названием своей должности.",
             8: "📢 <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ Прил.3: Один длинный свисток — 'Отправление поезда'. Три коротких — 'Требование к помощнику машиниста затормозить'.",
             9: "🔄 <b>ПРАВИЛО ДНЯ</b>\n\nИДП п.41: При маневрах сигналист должен быть виден ВСЕГДА. Если его не видно — СТОП.",
             10: "🔥 <b>ПРАВИЛО ДНЯ</b>\n\nИДП п.12.12: При срабатывании УКСПС машинист обязан немедленно остановить поезд и осмотреть локомотив.",
             
-            # Неделя 3: Неисправности и отказы
+            # НЕДЕЛЯ 3: Неисправности и отказы
             11: "🏔️ <b>ПРАВИЛО ДНЯ</b>\n\nПравила №151: Запрещается выпускать локомотив из депо, если не работают песочницы для движения вперед.",
             12: "💨 <b>ПРАВИЛО ДНЯ</b>\n\nИДП п.12.13: При частых самопроизвольных торможениях необходимо остановиться и проверить тормозную магистраль.",
             13: "❄️ <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ п.12.18: При гололеде скорость должна быть снижена настолько, чтобы обеспечить остановку в пределах видимости.",
             14: "🌫️ <b>ПРАВИЛО ДНЯ</b>\n\nПТЭ п.12.7: При движении в туман, когда видимость менее 1000 м, машинист должен подавать оповестительный сигнал.",
             15: "💨 <b>ПРАВИЛО ДНЯ</b>\n\nИнструкция по погоде: При скорости ветра свыше 25 м/с вводятся ограничения скорости для порожних вагонов.",
             
-            # Неделя 4: Зимняя эксплуатация
+            # НЕДЕЛЯ 4: Зимняя эксплуатация
             16: "🌨️ <b>ПРАВИЛО ДНЯ</b>\n\nПри снежных заносах скорость должна быть снижена, особое внимание - состоянию стрелочных переводов.",
             17: "🧊 <b>ПРАВИЛО ДНЯ</b>\n\nПри температуре ниже -25°C обязательна проверка работы тормозного оборудования каждые 2 часа.",
             18: "🌙 <b>ПРАВИЛО ДНЯ</b>\n\nПри маневрах в темное время суток скорость не более 15 км/ч, обязательное освещение рабочей зоны.",
@@ -171,7 +374,7 @@ class SafetyContentManager:
             8: "🧠 <b>ПСИХОЛОГИЯ БЕЗОПАСНОСТИ</b>\n\nПринятие решений на морозе: Холод замедляет реакцию. Заранее продумывайте действия в типичных зимних ситуациях."
         }
 
-        def _load_new_regulations(self) -> Dict:
+    def _load_new_regulations(self) -> Dict:
         return {
             1: "📋 <b>НОВОЕ В НТД</b>\n\nОбновленная Инструкция по сигнализации (ИСИ). Основные изменения: уточнены сигналы при маневрах с использованием радиосвязи.",
             2: "📋 <b>НОВОЕ В НТД</b>\n\nПоправки в ПТЭ: При отказе САУТ в пути следования необходимо немедленно информировать поездного диспетчера.",
@@ -272,7 +475,6 @@ class SafetyContentManager:
         }
 
     def _load_assistant_duties(self) -> Dict:
-        """Контент для помощника машиниста с обязанностями составителя"""
         return {
             1: "👨‍💼 <b>ОБЯЗАННОСТИ ПОМОЩНИКА МАШИНИСТА</b>\n\nПри маневрах:\n• Контролировать свободность пути\n• Подавать четкие сигналы машинисту\n• Следить за габаритами подвижного состава\n• Контролировать сцепку и расцепку",
             2: "👨‍💼 <b>ОБЯЗАННОСТИ ПОМОЩНИКА МАШИНИСТА</b>\n\nЗакрепление состава:\n• Правильная установка башмаков\n• Контроль ручных тормозов\n• Проверка надежности закрепления\n• Доклад машинисту о готовности",
@@ -280,256 +482,286 @@ class SafetyContentManager:
             4: "👨‍💼 <b>ОБЯЗАННОСТИ ПОМОЩНИКА МАШИНИСТА</b>\n\nТехника безопасности:\n• Не находиться в опасной зоне при маневрах\n• Использовать СИЗ при сцепке\n• Контролировать видимость сигналиста\n• Соблюдать дистанцию до движущегося состава"
         }
 
-    def get_week_of_month(self) -> int:
-        """Определение недели месяца"""
-        today = datetime.now()
-        first_day = today.replace(day=1)
-        dom = today.day
-        adjusted_dom = dom + first_day.weekday()
-        return (adjusted_dom - 1) // 7 + 1
-
-    def get_day_of_week(self) -> int:
-        """Получение дня недели (1-5 для Пн-Пт)"""
-        return datetime.now().weekday() + 1
-
-    async def send_daily_content(self, application):
-        """Отправка ежедневного контента по расписанию"""
-        try:
-            now = datetime.now()
-            current_time = now.strftime("%H:%M")
-            current_week = self.get_week_of_month()
-            current_day = self.get_day_of_week()
-            
-            # Для тестирования - используем фиксированную неделю
-            if current_week > 4:
-                current_week = 4
-            
-            content = await self._get_content_for_time(current_time, current_week, current_day)
-            
-            if content:
-                if isinstance(content, tuple):  # Интерактивный контент
-                    message, keyboard = content
-                    await application.bot.send_message(
-                        chat_id=self.channel_id,
-                        text=message,
-                        reply_markup=keyboard,
-                        parse_mode='HTML'
-                    )
-                else:  # Обычный текст
-                    keyboard = InlineKeyboardMarkup([
-                        [InlineKeyboardButton("💬 Комментарий", callback_data="comment")]
-                    ])
-                    await application.bot.send_message(
-                        chat_id=self.channel_id,
-                        text=content,
-                        reply_markup=keyboard,
-                        parse_mode='HTML'
-                    )
-                logger.info(f"Content sent for {current_time}")
-                    
-        except Exception as e:
-            logger.error(f"Error sending daily content: {e}")
-
-    async def _get_content_for_time(self, time_str: str, week: int, day: int):
-        """Получение контента для конкретного времени"""
-        content_map = {
-            '08:30': self._get_daily_rule_content(day),
-            '10:00': self._get_morning_content(week, day),
-            '12:00': self._get_midday_content(week, day),
-            '14:00': self._get_tech_training_content(week),
-            '16:00': self._get_incident_analysis_content(week),
-            '18:00': self._get_psychology_content(day),
-            '20:00': self._get_evening_content(week, day)
-        }
+    # === МЕТОДЫ ПОЛУЧЕНИЯ КОНТЕНТА ===
+    def _get_daily_rule_content(self):
+        """Получение правила дня для текущего дня"""
+        day_of_week = datetime.now(self.target_tz).weekday() + 1  # 1-5 Пн-Пт
+        week_of_month = self._get_week_of_month()
+        rule_number = (week_of_month - 1) * 5 + day_of_week
         
-        return content_map.get(time_str)
+        content = self.content_db['daily_rules'].get(rule_number)
+        if content:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💬 Комментарий", callback_data="comment")]
+            ])
+            return content, keyboard
+        return None
 
-    def _get_daily_rule_content(self, day: int) -> str:
-        """Получение правила дня"""
-        rule_number = (self.get_week_of_month() - 1) * 5 + day
-        return self.content_db['daily_rules'].get(rule_number, "")
-
-    def _get_morning_content(self, week: int, day: int):
-        """Утренний контент (цифры/тесты)"""
-        if day in [2, 4]:  # Вторник, Четверг - тесты
-            test_data = self.content_db['express_tests'].get(week)
+    def _get_morning_content(self):
+        """Получение утреннего контента (цифры/тесты)"""
+        week_of_month = self._get_week_of_month()
+        day_of_week = datetime.now(self.target_tz).weekday() + 1
+        
+        if day_of_week in [2, 4]:  # Вторник, Четверг - тесты
+            test_data = self.content_db['express_tests'].get(week_of_month)
             if test_data:
                 keyboard = [
-                    [InlineKeyboardButton(option, callback_data=f"test_{week}_{i}")]
+                    [InlineKeyboardButton(option, callback_data=f"test_{week_of_month}_{i}")]
                     for i, option in enumerate(test_data['options'])
                 ]
                 keyboard.append([InlineKeyboardButton("💬 Комментарий", callback_data="comment")])
                 return test_data['question'], InlineKeyboardMarkup(keyboard)
         
         # Понедельник, Среда, Пятница - цифры
-        number_data = self.content_db['safety_numbers'].get(week)
+        number_data = self.content_db['safety_numbers'].get(week_of_month)
         if number_data:
             keyboard = [[InlineKeyboardButton("💬 Комментарий", callback_data="comment")]]
             return number_data, InlineKeyboardMarkup(keyboard)
         
-        return ""
+        return None
 
-    def _get_midday_content(self, week: int, day: int):
-        """Дневной контент (задачи/опросы)"""
-        if day == 5:  # Пятница - опрос
-            poll_data = self.content_db['weekly_polls'].get(week)
+    def _get_midday_content(self):
+        """Получение дневного контента (задачи/опросы)"""
+        week_of_month = self._get_week_of_month()
+        day_of_week = datetime.now(self.target_tz).weekday() + 1
+        
+        if day_of_week == 5:  # Пятница - опрос
+            poll_data = self.content_db['weekly_polls'].get(week_of_month)
             if poll_data:
                 keyboard = [
-                    [InlineKeyboardButton(option, callback_data=f"poll_{week}_{i}")]
+                    [InlineKeyboardButton(option, callback_data=f"poll_{week_of_month}_{i}")]
                     for i, option in enumerate(poll_data['options'])
                 ]
                 keyboard.append([InlineKeyboardButton("💬 Комментарий", callback_data="comment")])
                 return poll_data['question'], InlineKeyboardMarkup(keyboard)
         
         # Пн-Чт - ситуационные задачи
-        task_data = self.content_db['weekly_tasks'].get(week)
+        task_data = self.content_db['weekly_tasks'].get(week_of_month)
         if task_data:
-            if day in [1, 2, 3, 4]:  # Понедельник-Четверг - вопрос
+            if day_of_week in [1, 2, 3, 4]:  # Понедельник-Четверг - вопрос
                 keyboard = [[InlineKeyboardButton("💬 Комментарий", callback_data="comment")]]
                 return task_data['question'], InlineKeyboardMarkup(keyboard)
         
-        return ""
+        return None
 
-    def _get_tech_training_content(self, week: int):
-        """Техническая подготовка"""
-        tech_number = (week - 1) * 2 + (datetime.now().day % 2) + 1
-        tech_data = self.content_db['tech_training'].get(tech_number, "")
+    def _get_tech_training_content(self):
+        """Получение технической подготовки"""
+        week_of_month = self._get_week_of_month()
+        day_of_month = datetime.now(self.target_tz).day
+        tech_number = (week_of_month - 1) * 2 + (day_of_month % 2) + 1
+        
+        tech_data = self.content_db['tech_training'].get(tech_number)
         if tech_data:
             keyboard = [[InlineKeyboardButton("💬 Комментарий", callback_data="comment")]]
             return tech_data, InlineKeyboardMarkup(keyboard)
-        return ""
+        return None
 
-    def _get_incident_analysis_content(self, week: int):
-        """Анализ инцидентов"""
-        incident_data = self.content_db['incident_analysis'].get(week, "")
+    def _get_incident_analysis_content(self):
+        """Получение анализа инцидентов"""
+        week_of_month = self._get_week_of_month()
+        incident_data = self.content_db['incident_analysis'].get(week_of_month)
         if incident_data:
             keyboard = [[InlineKeyboardButton("💬 Комментарий", callback_data="comment")]]
             return incident_data, InlineKeyboardMarkup(keyboard)
-        return ""
+        return None
 
-    def _get_psychology_content(self, day: int):
-        """Психология безопасности"""
-        psych_number = (self.get_week_of_month() - 1) * 5 + day
-        psych_data = self.content_db['psychology'].get(psych_number, "")
+    def _get_psychology_content(self):
+        """Получение психологии безопасности"""
+        day_of_week = datetime.now(self.target_tz).weekday() + 1
+        week_of_month = self._get_week_of_month()
+        psych_number = (week_of_month - 1) * 5 + day_of_week
+        
+        psych_data = self.content_db['psychology'].get(psych_number)
         if psych_data:
             keyboard = [[InlineKeyboardButton("💬 Комментарий", callback_data="comment")]]
             return psych_data, InlineKeyboardMarkup(keyboard)
-        return ""
+        return None
 
-    def _get_evening_content(self, week: int, day: int):
-        """Вечерний контент"""
-        if day == 1:  # Понедельник - новые нормативы
-            regulation_data = self.content_db['new_regulations'].get(week, "")
+    def _get_evening_content(self):
+        """Получение вечернего контента"""
+        week_of_month = self._get_week_of_month()
+        day_of_week = datetime.now(self.target_tz).weekday() + 1
+        
+        if day_of_week == 1:  # Понедельник - новые нормативы
+            regulation_data = self.content_db['new_regulations'].get(week_of_month)
             if regulation_data:
                 keyboard = [[InlineKeyboardButton("💬 Комментарий", callback_data="comment")]]
                 return regulation_data, InlineKeyboardMarkup(keyboard)
         
-        # Добавляем контент для помощников машиниста по средам
-        if day == 3:  # Среда - обязанности помощника
-            assistant_data = self.content_db['assistant_duties'].get(week, "")
+        # Среда - обязанности помощника
+        if day_of_week == 3:
+            assistant_data = self.content_db['assistant_duties'].get(week_of_month)
             if assistant_data:
                 keyboard = [[InlineKeyboardButton("💬 Комментарий", callback_data="comment")]]
                 return assistant_data, InlineKeyboardMarkup(keyboard)
         
-        return ""
+        return None
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатий кнопок"""
-    query = update.callback_query
-    await query.answer()
-    
-    callback_data = query.data
-    
-    if callback_data.startswith('test_'):
-        # Обработка тестов
-        _, week, answer = callback_data.split('_')
-        week = int(week)
-        answer = int(answer)
+    def _get_week_of_month(self) -> int:
+        """Определение недели месяца в таймзоне Кемерово"""
+        today = datetime.now(self.target_tz)
+        first_day = today.replace(day=1)
+        dom = today.day
+        adjusted_dom = dom + first_day.weekday()
+        return (adjusted_dom - 1) // 7 + 1
+
+    def setup_handlers(self):
+        """Настройка обработчиков Telegram"""
+        self.application.add_handler(CallbackQueryHandler(self.handle_callback))
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("schedule", self.schedule_command))
+        self.application.add_handler(CommandHandler("test", self.test_command))
+
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /start"""
+        current_time_kemerovo = datetime.now(self.target_tz).strftime('%H:%M')
+        current_time_utc = datetime.now(self.server_tz).strftime('%H:%M')
         
-        test_data = safety_manager.content_db['express_tests'].get(week)
-        if test_data:
-            if answer == test_data['correct_answer']:
-                message = f"{test_data['explanation']}\n\n✅ Вы ответили правильно!"
-            else:
-                correct_option = test_data['options'][test_data['correct_answer']]
-                message = f"❌ Неправильно. Правильный ответ: {correct_option}\n\n{test_data['explanation']}"
-            
-            await query.edit_message_text(
-                text=message,
-                parse_mode='HTML'
-            )
-    
-    elif callback_data.startswith('poll_'):
-        # Обработка опросов
-        _, week, answer = callback_data.split('_')
-        week = int(week)
-        answer = int(answer)
-        
-        poll_data = safety_manager.content_db['weekly_polls'].get(week)
-        if poll_data:
-            selected_option = poll_data['options'][answer]
-            if answer == poll_data['correct_answer']:
-                message = f"✅ Вы выбрали правильный вариант: {selected_option}"
-            else:
-                correct_option = poll_data['options'][poll_data['correct_answer']]
-                message = f"❌ Вы выбрали: {selected_option}\n\nПравильный ответ: {correct_option}"
-            
-            await query.edit_message_text(
-                text=f"{poll_data['question']}\n\n{message}",
-                parse_mode='HTML'
-            )
-    
-    elif callback_data == 'comment':
-        # Кнопка комментария
-        await query.edit_message_text(
-            text=query.message.text + "\n\n💬 <b>Для комментариев напишите сообщение в чат</b>",
-            parse_mode='HTML'
+        await update.message.reply_text(
+            f"🚂 Безопасность движения РЖД\n\n"
+            f"⏰ Текущее время:\n"
+            f"Кемерово: {current_time_kemerovo} (UTC+7)\n"
+            f"Сервер: {current_time_utc} UTC\n\n"
+            f"Расписание публикаций (время Кемерово):\n"
+            f"08:30 - Правило дня\n"
+            f"10:00 - Цифры безопасности\n"
+            f"12:00 - Ситуационные задачи\n"
+            f"14:00 - Техническая подготовка\n"
+            f"16:00 - Анализ инцидентов\n"
+            f"18:00 - Психология безопасности\n"
+            f"20:00 - Новое в НТД (пн)\n\n"
+            f"Канал: @BezopasnostDvizenia_bot"
         )
 
-# Глобальный экземпляр менеджера контента
+    async def schedule_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать расписание с временными зонами"""
+        schedule_text = """
+📅 <b>РАСПИСАНИЕ ПУБЛИКАЦИЙ</b>
+
+⏰ <i>Время указано для Кемерово (UTC+7)</i>
+
+08:30 🚦 - Правило дня (ПТЭ/ИДП)
+10:00 📊 - Цифры безопасности / Тесты
+12:00 🚨 - Ситуационные задачи / Опросы
+14:00 🔧 - Техническая подготовка
+16:00 🔍 - Анализ инцидентов  
+18:00 🧠 - Психология безопасности
+20:00 📋 - Новое в НТД (по понедельникам)
+
+<b>Серверное время:</b> UTC
+<b>Целевое время:</b> Кемерово UTC+7
+"""
+        await update.message.reply_text(schedule_text, parse_mode='HTML')
+
+    async def test_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Тестовая команда для проверки бота"""
+        await update.message.reply_text(
+            "✅ Бот работает корректно!\n"
+            f"Канал: {self.channel_id}\n"
+            f"Таймзона: Кемерово (UTC+7)"
+        )
+
+    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик callback'ов"""
+        query = update.callback_query
+        await query.answer()
+        
+        callback_data = query.data
+        
+        if callback_data.startswith('test_'):
+            _, week, answer = callback_data.split('_')
+            week = int(week)
+            answer = int(answer)
+            
+            test_data = self.content_db['express_tests'].get(week)
+            if test_data:
+                if answer == test_data['correct_answer']:
+                    message = f"{test_data['explanation']}\n\n✅ Вы ответили правильно!"
+                else:
+                    correct_option = test_data['options'][test_data['correct_answer']]
+                    message = f"❌ Неправильно. Правильный ответ: {correct_option}\n\n{test_data['explanation']}"
+                
+                await query.edit_message_text(
+                    text=message,
+                    parse_mode='HTML'
+                )
+        
+        elif callback_data.startswith('poll_'):
+            _, week, answer = callback_data.split('_')
+            week = int(week)
+            answer = int(answer)
+            
+            poll_data = self.content_db['weekly_polls'].get(week)
+            if poll_data:
+                selected_option = poll_data['options'][answer]
+                if answer == poll_data['correct_answer']:
+                    message = f"✅ Вы выбрали правильный вариант: {selected_option}"
+                else:
+                    correct_option = poll_data['options'][poll_data['correct_answer']]
+                    message = f"❌ Вы выбрали: {selected_option}\n\nПравильный ответ: {correct_option}"
+                
+                await query.edit_message_text(
+                    text=f"{poll_data['question']}\n\n{message}",
+                    parse_mode='HTML'
+                )
+        
+        elif callback_data == 'comment':
+            await query.edit_message_text(
+                text=query.message.text + "\n\n💬 <b>Для комментариев напишите сообщение в чат</b>",
+                parse_mode='HTML'
+            )
+
+# Глобальный экземпляр
 safety_manager = SafetyContentManager()
 
-async def scheduled_task(context: ContextTypes.DEFAULT_TYPE):
-    """Планируемая задача для отправки контента"""
-    await safety_manager.send_daily_content(context.application)
-
-async def manual_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручная отправка контента для тестирования"""
-    if update.effective_user.id != 123456789:  # Замените на ваш ID
-        await update.message.reply_text("У вас нет прав для этой команды")
-        return
+@app.route('/')
+def home():
+    current_time_utc = datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
+    current_time_kemerovo = datetime.now(pytz.timezone('Asia/Novokuznetsk')).strftime('%Y-%m-%d %H:%M:%S UTC+7')
     
-    await safety_manager.send_daily_content(context.application)
-    await update.message.reply_text("Контент отправлен")
+    return jsonify({
+        "status": "active",
+        "service": "RZD Safety Bot",
+        "version": "1.0.0",
+        "channel": "@BezopasnostDvizenia_bot",
+        "timezone": {
+            "server": "UTC",
+            "target": "Asia/Novokuznetsk (UTC+7)",
+            "current_utc": current_time_utc,
+            "current_kemerovo": current_time_kemerovo
+        }
+    })
 
-def main():
-    """Основная функция"""
-    try:
-        application = Application.builder().token(safety_manager.bot_token).build()
-        
-        # Обработчик callback'ов
-        application.add_handler(CallbackQueryHandler(handle_callback))
-        
-        # Команда для ручной отправки
-        application.add_handler(CommandHandler("send", manual_send))
-        
-        # Планировщик задач
-        job_queue = application.job_queue
-        
-        # Ежедневные публикации по расписанию
-        times = ['08:30', '10:00', '12:00', '14:00', '16:00', '18:00', '20:00']
-        for time_str in times:
-            job_queue.run_daily(
-                scheduled_task,
-                time=datetime.strptime(time_str, '%H:%M').time(),
-                name=f"daily_{time_str}"
-            )
-        
-        logger.info("Bot started successfully")
-        application.run_polling()
-        
-    except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
+@app.route('/health')
+def health_check():
+    return jsonify({
+        "status": "healthy", 
+        "timestamp": datetime.now().isoformat(),
+        "timezone": "UTC"
+    })
+
+@app.route('/schedule')
+def show_schedule():
+    """Показать текущее расписание"""
+    jobs = []
+    if hasattr(safety_manager, 'scheduler'):
+        for job in safety_manager.scheduler.get_jobs():
+            jobs.append({
+                "id": job.id,
+                "name": job.name,
+                "next_run": str(job.next_run_time)
+            })
+    
+    return jsonify({
+        "timezone": "UTC",
+        "target_timezone": "Asia/Novokuznetsk (UTC+7)",
+        "scheduled_jobs": jobs
+    })
+
+@app.route('/ping')
+def ping():
+    return jsonify({"status": "pong", "timestamp": datetime.now().isoformat()})
 
 if __name__ == '__main__':
-    main()
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=os.environ.get('DEBUG_MODE', False))
